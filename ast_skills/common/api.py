@@ -7,10 +7,34 @@ import pkgutil
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
 import networkx as nx
 from tqdm import tqdm
 import rich
+
+RICH_GITHUB_REPO = "Textualize/rich"
+
+
+class RichGithubTestRef(NamedTuple):
+    """Reference to a pytest case in a Textualize/rich GitHub checkout."""
+
+    repo_relative_path: str
+    test_qualname: str
+    lineno: int
+    url: str
+
+
+def _rich_github_blob_url(
+    *,
+    github_ref: str,
+    repo_relative_path: str,
+    lineno: int,
+) -> str:
+    return (
+        f"https://github.com/{RICH_GITHUB_REPO}/blob/"
+        f"{github_ref}/{repo_relative_path}#L{lineno}"
+    )
 
 
 @dataclass
@@ -23,6 +47,7 @@ class FunctionCallInfo:
     lineno: int | None
     end_lineno: int | None
     calls: list[str] = field(default_factory=list)
+    github_tests: list[RichGithubTestRef] = field(default_factory=list)
 
 
 @dataclass
@@ -182,6 +207,155 @@ def _collect_import_aliases(module_name: str, tree: ast.Module) -> dict[str, str
     return aliases
 
 
+def _parse_tests_module_dotted_name(repo_relative_path: str) -> str:
+    path = Path(repo_relative_path)
+    parts = list(path.with_suffix("").parts)
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts) if parts else "tests"
+
+
+def _iter_pytest_methods_in_class(
+    body: list[ast.stmt],
+    *,
+    class_short_name: str,
+    qualname_prefix: str,
+) -> Iterator[tuple[str, str | None, ast.FunctionDef | ast.AsyncFunctionDef]]:
+    for node in body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name.startswith("test"):
+                yield f"{qualname_prefix}.{node.name}", class_short_name, node
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            yield from _iter_pytest_methods_in_class(
+                node.body,
+                class_short_name=node.name,
+                qualname_prefix=f"{qualname_prefix}.{node.name}",
+            )
+
+
+def _iter_pytest_test_nodes(
+    body: list[ast.stmt],
+    *,
+    outer_class_qualname: str,
+) -> Iterator[tuple[str, str | None, ast.FunctionDef | ast.AsyncFunctionDef]]:
+    for node in body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name.startswith("test"):
+                qualname = (
+                    f"{outer_class_qualname}.{node.name}"
+                    if outer_class_qualname
+                    else node.name
+                )
+                yield qualname, None, node
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            prefix = (
+                f"{outer_class_qualname}.{node.name}"
+                if outer_class_qualname
+                else node.name
+            )
+            yield from _iter_pytest_methods_in_class(
+                node.body,
+                class_short_name=node.name,
+                qualname_prefix=prefix,
+            )
+
+
+def _iter_pytest_module_tests(
+    tree: ast.Module,
+) -> Iterator[tuple[str, str | None, ast.FunctionDef | ast.AsyncFunctionDef]]:
+    yield from _iter_pytest_test_nodes(tree.body, outer_class_qualname="")
+
+
+_GITHUB_TEST_INDEX_CACHE: dict[tuple[str, str], dict[str, list[RichGithubTestRef]]] = {}
+
+
+def _build_github_test_index(
+    *,
+    rich_repo_root: Path,
+    all_full_names: set[str],
+    method_name_to_full_names: dict[str, set[str]],
+    github_ref: str,
+) -> dict[str, list[RichGithubTestRef]]:
+    tests_root = rich_repo_root / "tests"
+    if not tests_root.is_dir():
+        return {}
+
+    reverse_index: dict[str, set[RichGithubTestRef]] = {}
+    paths = sorted(tests_root.rglob("*.py"))
+
+    for path in tqdm(paths, desc="Indexing rich GitHub tests"):
+        rel_path = path.relative_to(rich_repo_root).as_posix()
+        try:
+            source = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        try:
+            tree = ast.parse(source, filename=rel_path)
+        except SyntaxError:
+            continue
+
+        module_name = _parse_tests_module_dotted_name(rel_path)
+        module_index = _build_module_index(module_name, tree)
+        import_aliases = _collect_import_aliases(module_name, tree)
+
+        for qualname, class_name, test_node in _iter_pytest_module_tests(tree):
+            lineno = test_node.lineno or 1
+            test_ref = RichGithubTestRef(
+                rel_path,
+                qualname,
+                lineno,
+                _rich_github_blob_url(
+                    github_ref=github_ref,
+                    repo_relative_path=rel_path,
+                    lineno=lineno,
+                ),
+            )
+            collector = RichCallCollector(
+                module_name=module_name,
+                module_index=module_index,
+                import_aliases=import_aliases,
+                all_full_names=all_full_names,
+                method_name_to_full_names=method_name_to_full_names,
+                current_class_name=class_name,
+            )
+            collector.visit(test_node)
+            for symbol in set(collector.calls):
+                reverse_index.setdefault(symbol, set()).add(test_ref)
+
+    return {
+        symbol: sorted(
+            refs,
+            key=lambda item: (
+                item.repo_relative_path,
+                item.lineno,
+                item.test_qualname,
+            ),
+        )
+        for symbol, refs in reverse_index.items()
+    }
+
+
+def _get_cached_github_test_index(
+    *,
+    rich_repo_root: Path | None,
+    all_full_names: set[str],
+    method_name_to_full_names: dict[str, set[str]],
+    github_ref: str,
+) -> dict[str, list[RichGithubTestRef]]:
+    if rich_repo_root is None or not rich_repo_root.is_dir():
+        return {}
+
+    cache_key = (str(rich_repo_root.resolve()), github_ref)
+    if cache_key not in _GITHUB_TEST_INDEX_CACHE:
+        _GITHUB_TEST_INDEX_CACHE[cache_key] = _build_github_test_index(
+            rich_repo_root=rich_repo_root,
+            all_full_names=all_full_names,
+            method_name_to_full_names=method_name_to_full_names,
+            github_ref=github_ref,
+        )
+    return _GITHUB_TEST_INDEX_CACHE[cache_key]
+
+
 class RichCallCollector(ast.NodeVisitor):
     def __init__(
         self,
@@ -280,7 +454,11 @@ class RichCallCollector(ast.NodeVisitor):
         return None
 
 
-def collect_rich_class_infos() -> list[ClassInfo]:
+def collect_rich_class_infos(
+    *,
+    rich_repo_root: Path | None = None,
+    github_ref: str = "main",
+) -> list[ClassInfo]:
     module_names = list(_iter_rich_module_names())
 
     module_trees: dict[str, ast.Module] = {}
@@ -299,6 +477,12 @@ def collect_rich_class_infos() -> list[ClassInfo]:
 
     module_indexes, all_full_names, method_name_to_full_names = _build_global_indexes(
         module_trees
+    )
+    test_by_symbol = _get_cached_github_test_index(
+        rich_repo_root=rich_repo_root,
+        all_full_names=all_full_names,
+        method_name_to_full_names=method_name_to_full_names,
+        github_ref=github_ref,
     )
 
     results: list[ClassInfo] = []
@@ -345,6 +529,7 @@ def collect_rich_class_infos() -> list[ClassInfo]:
                     lineno=getattr(child, "lineno", None),
                     end_lineno=getattr(child, "end_lineno", None),
                     calls=sorted(set(collector.calls)),
+                    github_tests=list(test_by_symbol.get(full_name, [])),
                 )
             )
 
@@ -366,6 +551,12 @@ def collect_rich_class_infos() -> list[ClassInfo]:
     console.print(f"Modules with no source: {skipped_no_source}")
     if failed_imports:
         console.print(f"Failed imports: {failed_imports}")
+    if rich_repo_root is not None and rich_repo_root.is_dir():
+        link_count = sum(len(refs) for refs in test_by_symbol.values())
+        console.print(
+            f"GitHub test index: {len(test_by_symbol)} rich symbols "
+            f"with tests, {link_count} total links"
+        )
 
     return results
 
@@ -378,7 +569,11 @@ def _sanitize_int(value):
     return -1 if value is None else int(value)
 
 
-def collect_rich_only_call_infos() -> list[FunctionCallInfo]:
+def collect_rich_only_call_infos(
+    *,
+    rich_repo_root: Path | None = None,
+    github_ref: str = "main",
+) -> list[FunctionCallInfo]:
     module_names = list(_iter_rich_module_names())
 
     module_trees: dict[str, ast.Module] = {}
@@ -397,6 +592,12 @@ def collect_rich_only_call_infos() -> list[FunctionCallInfo]:
 
     module_indexes, all_full_names, method_name_to_full_names = _build_global_indexes(
         module_trees
+    )
+    test_by_symbol = _get_cached_github_test_index(
+        rich_repo_root=rich_repo_root,
+        all_full_names=all_full_names,
+        method_name_to_full_names=method_name_to_full_names,
+        github_ref=github_ref,
     )
 
     all_defs: list[
@@ -437,6 +638,7 @@ def collect_rich_only_call_infos() -> list[FunctionCallInfo]:
                 lineno=getattr(node, "lineno", None),
                 end_lineno=getattr(node, "end_lineno", None),
                 calls=sorted(set(collector.calls)),
+                github_tests=list(test_by_symbol.get(full_name, [])),
             )
         )
 
@@ -447,8 +649,19 @@ def collect_rich_only_call_infos() -> list[FunctionCallInfo]:
     console.print(f"Modules with no source: {skipped_no_source}")
     if failed_imports:
         console.print(f"Failed imports: {failed_imports}")
+    if rich_repo_root is not None and rich_repo_root.is_dir():
+        link_count = sum(len(refs) for refs in test_by_symbol.values())
+        console.print(
+            f"GitHub test index: {len(test_by_symbol)} rich symbols "
+            f"with tests, {link_count} total links"
+        )
 
     return results
+
+
+def github_tests(function_info: FunctionCallInfo) -> list[RichGithubTestRef]:
+    """Return GitHub test references that call a specific rich symbol."""
+    return function_info.github_tests
 
 
 def build_call_graph(
