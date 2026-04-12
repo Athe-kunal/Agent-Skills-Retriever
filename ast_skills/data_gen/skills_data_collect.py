@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import base64
 import datetime
-import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -41,39 +39,11 @@ class SkillMdRecord:
 
 
 class SkillMdBatchCustomIdPayload(NamedTuple):
-    """Decoded from OpenAI Batch ``custom_id`` from ``encode_skill_md_record_batch_custom_id``.
-
-    For compact ``sm2-`` ids, ``relative_path`` and ``metadata`` are empty; use ``custom_id``
-    equality against ``skill_md_records.jsonl``.
-    """
+    """Decoded values from ``encode_skill_md_record_batch_custom_id``."""
 
     relative_path: str
     metadata: dict[str, str]
     record_index: int
-
-
-def _b64url_decode_padded(segment: str) -> bytes:
-    padding = 4 - (len(segment) % 4)
-    if padding != 4:
-        segment = segment + ("=" * padding)
-    return base64.urlsafe_b64decode(segment.encode("ascii"))
-
-
-def _skill_md_batch_payload_json(
-    record: SkillMdRecord,
-    record_index: int,
-) -> str:
-    rel = scrub_surrogate_codepoints(record.relative_path)
-    meta = {
-        scrub_surrogate_codepoints(k): scrub_surrogate_codepoints(v)
-        for k, v in sorted(record.metadata.items())
-    }
-    return json.dumps(
-        {"i": record_index, "md": meta, "rp": rel},
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
 
 
 def encode_skill_md_record_batch_custom_id(
@@ -81,72 +51,29 @@ def encode_skill_md_record_batch_custom_id(
     record_index: int,
 ) -> str:
     """
-    Build a Batch API ``custom_id`` at most ``MAX_OPENAI_BATCH_CUSTOM_ID_LEN`` characters.
+    Build a compact and stable Batch API ``custom_id``.
 
-    Uses ``sm1-`` + base64url(JSON) with keys ``i``, ``rp``, ``md`` when that fits; otherwise
-    ``sm2-`` + base64url(JSON) with ``i`` and ``h`` (sha256 hex of the same full JSON payload).
-    For ``sm2-``, join batch results to ``skill_md_records.jsonl`` on exact ``custom_id``;
-    ``decode_skill_md_batch_custom_id`` then returns empty path/metadata (index only).
-
-    Legacy ids prefixed with ``sm-`` (no digit) remain decodable as full payloads.
+    The id embeds only the record index because batch-output correlation already happens via
+    the ``skill_md_records.jsonl`` rows written alongside batch input.
     """
-    payload = _skill_md_batch_payload_json(record, record_index)
-    blob = (
-        base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
-    )
-    lossless_id = f"sm1-{blob}"
-    if len(lossless_id) <= MAX_OPENAI_BATCH_CUSTOM_ID_LEN:
-        return lossless_id
-
-    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-    compact = json.dumps(
-        {"h": digest, "i": record_index},
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-    compact_blob = (
-        base64.urlsafe_b64encode(compact.encode("utf-8"))
-        .decode("ascii")
-        .rstrip("=")
-    )
-    compact_id = f"sm2-{compact_blob}"
-    if len(compact_id) > MAX_OPENAI_BATCH_CUSTOM_ID_LEN:
+    del record
+    custom_id = f"sm-{record_index}"
+    if len(custom_id) > MAX_OPENAI_BATCH_CUSTOM_ID_LEN:
         raise ValueError(
-            f"custom_id still exceeds {MAX_OPENAI_BATCH_CUSTOM_ID_LEN=}; "
-            f"{len(compact_id)=} (unexpected)"
+            f"custom_id exceeds {MAX_OPENAI_BATCH_CUSTOM_ID_LEN=}; {len(custom_id)=}"
         )
-    return compact_id
+    return custom_id
 
 
 def decode_skill_md_batch_custom_id(custom_id: str) -> SkillMdBatchCustomIdPayload:
-    """Recover path/metadata/index from ``custom_id``; ``sm2-`` ids yield empty path/metadata."""
-    if custom_id.startswith("sm2-"):
-        raw = _b64url_decode_padded(custom_id[4:]).decode("utf-8")
-        data = json.loads(raw)
-        return SkillMdBatchCustomIdPayload(
-            relative_path="",
-            metadata={},
-            record_index=int(data["i"]),
-        )
-
-    if custom_id.startswith("sm1-"):
-        blob_start = 4
-    elif custom_id.startswith("sm-"):
-        # Legacy lossless ids (before ``sm1-``); must run after ``sm1-`` / ``sm2-`` checks.
-        blob_start = 3
-    else:
-        raise ValueError(
-            "Expected custom_id starting with 'sm1-', 'sm2-', or legacy 'sm-'; "
-            f"got {custom_id[:48]!r}..."
-        )
-
-    raw = _b64url_decode_padded(custom_id[blob_start:]).decode("utf-8")
-    data = json.loads(raw)
+    """Recover record index from a compact ``sm-<index>`` custom id."""
+    if not custom_id.startswith("sm-"):
+        raise ValueError(f"Expected custom_id starting with 'sm-'; got {custom_id!r}")
+    record_index = int(custom_id[3:])
     return SkillMdBatchCustomIdPayload(
-        relative_path=str(data["rp"]),
-        metadata=coerce_skill_md_metadata(data["md"]),
-        record_index=int(data["i"]),
+        relative_path="",
+        metadata={},
+        record_index=record_index,
     )
 
 
