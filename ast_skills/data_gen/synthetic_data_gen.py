@@ -115,7 +115,17 @@ class SkillMdExtraction(pydantic.BaseModel):
     seed_questions: list[str]
 
 
-SKILL_MD_EXTRACTION_SYSTEM_MESSAGE = """You read Agent Skill files (SKILL.md). You respond with one JSON object only, matching the provided schema: keys reasoning, what, why, seed_questions — no markdown fences, no extra keys, no commentary outside JSON. Return exactly those keys in that order. Extract what the skill is for, how it can be used, and why the skill exists based on the SKILL.md content. Be as descriptive as possible while staying grounded in the provided SKILL.md. The what field should describe the skill’s purpose and practical usage. The why field should explain why the skill is there. The seed_questions field should contain exactly 5 questions or tasks that mirror real-world situations where this skill can be used. If required context is missing from the SKILL.md, do not guess; reflect the gap briefly in the relevant fields. Before finalizing, verify that the output is valid JSON and that every field is present.
+SKILL_MD_EXTRACTION_SYSTEM_MESSAGE = """You read Agent Skill files (SKILL.md). Return exactly one JSON object with keys in this order: reasoning, what, why, seed_questions. No markdown fences, no extra keys, and no commentary outside JSON.
+
+Ground every statement in the provided SKILL.md. Use all relevant evidence from both narrative sections and implementation sections (for example: commands, scripts, API/tool usage, configuration, inputs/outputs, constraints, caveats, workflow steps, examples, and failure handling).
+
+Writing requirements:
+- `what`: comprehensive capability description. Explain the full scope of what the skill enables, key operations, required inputs, expected outputs, important options, and notable constraints.
+- `why`: comprehensive situational trigger. Explain when to use the skill, the user problems it solves, operational context, trade-offs, and why this workflow is preferred over generic alternatives.
+- `reasoning`: concise justification that maps the extracted `what` and `why` to explicit evidence in the SKILL.md and explains why each seed question is an appropriate retrieval target.
+- `seed_questions`: exactly 5 realistic user tasks that are materially different in intent and wording and together cover the main use-cases implied by the SKILL.md.
+
+Do not invent tools or behaviors that are not present in the SKILL.md. If something is missing, explicitly call out the gap instead of guessing. Before returning, validate that the output is valid JSON and that every required field is present.
 """
 
 
@@ -124,15 +134,6 @@ SKILL_MD_EXTRACTION_PROMPT = """You are given the complete markdown source of on
 ----- SKILL.md markdown -----
 {content}
 ----- end -----
-
-From that markdown alone, fill exactly these four fields (and no others):
-
-1. reasoning: how the document implies capability vs. trigger, and why each seed question fits.
-2. what: what the skill enables an agent to do (the capability).
-3. why: when or under what situation to apply this skill; must not duplicate `what` wording.
-4. seed_questions: realistic user tasks where this skill is the right tool; each question must differ clearly in intent and wording.
-
-Do not invent tools or steps absent from the file. Paraphrase; do not copy long spans of the source.
 """
 
 
@@ -142,41 +143,20 @@ SKILL_MD_RESPONSE_FORMAT = {
         "name": "skill_md_extraction_response",
         "schema": {
             "type": "object",
-            "description": (
-                "Structured extraction from one SKILL.md: capability, trigger, rationale, "
-                "and five distinct retrieval-style user questions."
-            ),
             "properties": {
                 "reasoning": {
                     "type": "string",
-                    "description": (
-                        "Explain how the SKILL.md text supports the chosen what/why and why "
-                        "each seed question is a good match."
-                    ),
                 },
                 "what": {
                     "type": "string",
-                    "description": (
-                        "The concrete capability this skill gives an agent (what it can do), "
-                        "grounded in the file; be concise."
-                    ),
                 },
                 "why": {
                     "type": "string",
-                    "description": (
-                        "When or in what situation to use this skill (situational trigger); "
-                        "must not repeat the same phrasing as what; be concise."
-                    ),
                 },
                 "seed_questions": {
                     "type": "array",
-                    "description": (
-                        "Exactly five realistic user task queries for which this skill is an "
-                        "appropriate retrieval target; each must differ in intent and wording."
-                    ),
                     "items": {
                         "type": "string",
-                        "description": "Natural-language user task or query.",
                     },
                     "minItems": 5,
                     "maxItems": 5,
@@ -245,6 +225,10 @@ def openai_batch_chat_completion_request(
 
 DEFAULT_BATCH_ENDPOINT = "/v1/chat/completions"
 DEFAULT_BATCH_COMPLETION_WINDOW = "24h"
+OPENAI_BATCH_MAX_INPUT_FILE_BYTES = 200 * 1024 * 1024
+OPENAI_BATCH_SAFE_INPUT_FILE_BYTES = (
+    OPENAI_BATCH_MAX_INPUT_FILE_BYTES - (10 * 1024 * 1024)
+)
 
 
 def submit_openai_batch_job(
@@ -299,26 +283,42 @@ def build_skill_md_extraction_user_content(skill_md_record: SkillMdRecord) -> st
     )
 
 
+def _jsonl_line_size_bytes(row: dict) -> int:
+    """Return UTF-8 byte size for one JSONL row (including newline)."""
+    return len((json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8"))
+
+
+def _would_exceed_batch_file_size(
+    current_size_bytes: int,
+    next_line_size_bytes: int,
+    max_file_size_bytes: int,
+) -> bool:
+    """Check whether appending a row would exceed the batch input file size limit."""
+    return current_size_bytes + next_line_size_bytes > max_file_size_bytes
+
+
 def write_openai_batch_skill_md_extraction_jsonl_for_records(
     skill_md_records: list[SkillMdRecord],
     output_path: str,
     *,
     model: str = DEFAULT_OPENAI_BATCH_MODEL,
     max_tokens: int = 1024,
+    max_file_size_bytes: int = OPENAI_BATCH_SAFE_INPUT_FILE_BYTES,
 ) -> int:
     """
     Emit OpenAI Batch JSONL for SKILL.md extraction, from in-memory records.
 
-    Each request ``custom_id`` is at most 500 characters (see
-    ``MAX_OPENAI_BATCH_CUSTOM_ID_LEN`` in ``skills_data_collect``): lossless ``sm1-`` when
-    possible, else compact ``sm2-`` (join batch output to ``skill_md_records.jsonl`` on
-    ``custom_id`` when path/metadata are not embedded).
+    Each request ``custom_id`` is compact (``sm-<record_index>``) and aligns to the
+    corresponding record row in ``skill_md_records.jsonl``.
 
     ``batches.create(..., metadata={...})`` is separate: job-level tags on the batch
     object, not echoed per completion line.
     """
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    written_count = 0
+    current_size_bytes = 0
+
     with out_path.open("w", encoding="utf-8") as output_file:
         for index, skill_md_record in enumerate(skill_md_records):
             custom_id = encode_skill_md_record_batch_custom_id(
@@ -339,11 +339,28 @@ def write_openai_batch_skill_md_extraction_jsonl_for_records(
                 max_tokens=max_tokens,
                 response_format=SKILL_MD_RESPONSE_FORMAT,
             )
+            line_size_bytes = _jsonl_line_size_bytes(request_line)
+            if _would_exceed_batch_file_size(
+                current_size_bytes=current_size_bytes,
+                next_line_size_bytes=line_size_bytes,
+                max_file_size_bytes=max_file_size_bytes,
+            ):
+                logger.info(
+                    "Stopping batch row writes at size limit: "
+                    f"{current_size_bytes=} {line_size_bytes=} {max_file_size_bytes=}"
+                )
+                break
+
             output_file.write(json.dumps(request_line, ensure_ascii=False) + "\n")
+            current_size_bytes += line_size_bytes
+            written_count += 1
 
     logger.info(f"{output_path=}")
     logger.info(f"{len(skill_md_records)=}")
-    return len(skill_md_records)
+    logger.info(f"{written_count=}")
+    logger.info(f"{current_size_bytes=}")
+    logger.info(f"{max_file_size_bytes=}")
+    return written_count
 
 
 def write_openai_batch_skill_md_extraction_jsonl(
@@ -353,6 +370,7 @@ def write_openai_batch_skill_md_extraction_jsonl(
     model: str = DEFAULT_OPENAI_BATCH_MODEL,
     max_records: int | None = None,
     max_tokens: int = 1024,
+    max_file_size_bytes: int = OPENAI_BATCH_SAFE_INPUT_FILE_BYTES,
 ) -> int:
     """Emit OpenAI Batch JSONL for SkillMdRecord extraction (read records from JSONL)."""
     skill_md_records = read_skill_md_records_jsonl(records_path)
@@ -365,6 +383,7 @@ def write_openai_batch_skill_md_extraction_jsonl(
         output_path,
         model=model,
         max_tokens=max_tokens,
+        max_file_size_bytes=max_file_size_bytes,
     )
 
 
@@ -375,6 +394,7 @@ def write_openai_batch_seed_jsonl(
     model: str = DEFAULT_OPENAI_BATCH_MODEL,
     max_skills: int | None = None,
     max_tokens: int = 4096,
+    max_file_size_bytes: int = OPENAI_BATCH_SAFE_INPUT_FILE_BYTES,
 ) -> int:
     """
     Emit a .jsonl file suitable for OpenAI Batch upload (purpose=batch).
@@ -393,6 +413,9 @@ def write_openai_batch_seed_jsonl(
     if max_skills is not None:
         annotations = annotations[:max_skills]
 
+    written_count = 0
+    current_size_bytes = 0
+
     with open(output_path, "w", encoding="utf-8") as out:
         for i, ann in enumerate(annotations):
             custom_id = _sanitize_custom_id(ann["skill_id"], i)
@@ -407,9 +430,26 @@ def write_openai_batch_seed_jsonl(
                 messages=messages,
                 max_tokens=max_tokens,
             )
-            out.write(json.dumps(req, ensure_ascii=False) + "\n")
+            line_size_bytes = _jsonl_line_size_bytes(req)
+            if _would_exceed_batch_file_size(
+                current_size_bytes=current_size_bytes,
+                next_line_size_bytes=line_size_bytes,
+                max_file_size_bytes=max_file_size_bytes,
+            ):
+                logger.info(
+                    "Stopping seed batch row writes at size limit: "
+                    f"{current_size_bytes=} {line_size_bytes=} {max_file_size_bytes=}"
+                )
+                break
 
-    return len(annotations)
+            out.write(json.dumps(req, ensure_ascii=False) + "\n")
+            current_size_bytes += line_size_bytes
+            written_count += 1
+
+    logger.info(f"{written_count=}")
+    logger.info(f"{current_size_bytes=}")
+    logger.info(f"{max_file_size_bytes=}")
+    return written_count
 
 
 # ──────────────────────────────────────────────
@@ -671,6 +711,7 @@ class SyntheticDataGenCli:
         model: str = DEFAULT_OPENAI_BATCH_MODEL,
         max_records: int | None = None,
         max_tokens: int = 1024,
+        max_file_size_bytes: int = OPENAI_BATCH_SAFE_INPUT_FILE_BYTES,
     ) -> None:
         """
         Scan SKILL.md under skills_root, save records JSONL, then write OpenAI Batch input JSONL.
@@ -679,9 +720,9 @@ class SyntheticDataGenCli:
         string (e.g. empty ``""``) to skip writing the records file.
 
         Each records line includes ``record_index`` and ``custom_id`` matching the batch job.
-        Each ``custom_id`` is capped at 500 characters; decode with
-        ``decode_skill_md_batch_custom_id`` in ``skills_data_collect``, or join batch lines
-        to this file on exact ``custom_id`` (required for ``sm2-`` compact ids).
+        Each ``custom_id`` follows ``sm-<record_index>`` and is capped at 500 characters.
+        Decode with ``decode_skill_md_batch_custom_id`` in ``skills_data_collect``, or join
+        batch lines to this file on exact ``custom_id``.
         """
         logger.info(f"{skills_root=}")
         records = collect_skill_md_without_chinese(skills_root)
@@ -704,6 +745,7 @@ class SyntheticDataGenCli:
             batch_output_path,
             model=model,
             max_tokens=max_tokens,
+            max_file_size_bytes=max_file_size_bytes,
         )
         logger.info(
             f"Wrote {record_count} batch lines to {batch_output_path} "
@@ -718,6 +760,7 @@ class SyntheticDataGenCli:
         model: str = DEFAULT_OPENAI_BATCH_MODEL,
         max_records: int | None = None,
         max_tokens: int = 4096,
+        max_file_size_bytes: int = OPENAI_BATCH_SAFE_INPUT_FILE_BYTES,
     ) -> None:
         """
         Same as extract_skill_md_batch but read pre-built records JSONL instead of scanning.
@@ -749,6 +792,7 @@ class SyntheticDataGenCli:
             batch_output_path,
             model=model,
             max_tokens=max_tokens,
+            max_file_size_bytes=max_file_size_bytes,
         )
         logger.info(
             f"Wrote {record_count} batch lines to {batch_output_path} "
@@ -762,6 +806,7 @@ class SyntheticDataGenCli:
         model: str = DEFAULT_OPENAI_BATCH_MODEL,
         max_skills: int | None = None,
         max_tokens: int = 4096,
+        max_file_size_bytes: int = OPENAI_BATCH_SAFE_INPUT_FILE_BYTES,
     ) -> None:
         """
         Write OpenAI Batch API input JSONL (one chat completion per annotation).
@@ -776,6 +821,7 @@ class SyntheticDataGenCli:
             model=model,
             max_skills=max_skills,
             max_tokens=max_tokens,
+            max_file_size_bytes=max_file_size_bytes,
         )
         logger.info(f"Wrote {n} batch lines to {batch_output_path} (model={model})")
 
