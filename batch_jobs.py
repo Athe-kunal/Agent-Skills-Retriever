@@ -15,12 +15,9 @@ from openai import AsyncOpenAI, OpenAI
 INPUT_DIR = Path("data")
 OUTPUT_DIR = Path("batch_results")
 ONLINE_OUTPUT_DIR = Path("online_results")
-POLL_INTERVAL_SECONDS = 30
+POLL_INTERVAL_SECONDS = 300
 DEFAULT_ONLINE_CONCURRENCY = 32
 
-# Choose the endpoint that matches the requests inside each JSONL file.
-# For modern usage, /v1/responses is usually the best default.
-BATCH_ENDPOINT = "/v1/responses"
 DEFAULT_MODE = "batch"
 ONLINE_MODE = "online"
 
@@ -119,21 +116,37 @@ def load_jsonl_lines(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def validate_batch_jsonl(path: Path) -> None:
+def validate_batch_record(record: dict[str, Any], path: Path, line_number: int) -> None:
+    """Validates one batch JSONL record shape."""
+    if "custom_id" not in record:
+        raise ValueError(f"{path} line {line_number}: missing 'custom_id'")
+    if record.get("method") != "POST":
+        raise ValueError(f"{path} line {line_number}: expected method='POST'")
+    if "url" not in record:
+        raise ValueError(f"{path} line {line_number}: missing 'url'")
+    if "body" not in record or not isinstance(record["body"], dict):
+        raise ValueError(f"{path} line {line_number}: missing or invalid 'body'")
+
+
+def validate_batch_jsonl(path: Path) -> list[dict[str, Any]]:
     """Validates batch JSONL record shape before processing."""
     records = load_jsonl_lines(path)
     if not records:
         raise ValueError(f"{path} is empty.")
 
     for idx, record in enumerate(records, start=1):
-        if "custom_id" not in record:
-            raise ValueError(f"{path} line {idx}: missing 'custom_id'")
-        if record.get("method") != "POST":
-            raise ValueError(f"{path} line {idx}: expected method='POST'")
-        if "url" not in record:
-            raise ValueError(f"{path} line {idx}: missing 'url'")
-        if "body" not in record or not isinstance(record["body"], dict):
-            raise ValueError(f"{path} line {idx}: missing or invalid 'body'")
+        validate_batch_record(record=record, path=path, line_number=idx)
+    return records
+
+
+def resolve_batch_endpoint(records: list[dict[str, Any]], path: Path) -> str:
+    """Resolves a single endpoint value for a batch JSONL file."""
+    endpoints = {str(record["url"]) for record in records}
+    if len(endpoints) != 1:
+        raise ValueError(f"{path} must contain exactly one unique 'url' value.")
+    endpoint = endpoints.pop()
+    logger.info(f"{endpoint=}")
+    return endpoint
 
 
 def upload_batch_file(client: OpenAI, path: Path) -> str:
@@ -146,11 +159,11 @@ def upload_batch_file(client: OpenAI, path: Path) -> str:
     return uploaded.id
 
 
-def create_batch(client: OpenAI, input_file_id: str, source_file: Path) -> str:
+def create_batch(client: OpenAI, input_file_id: str, source_file: Path, endpoint: str) -> str:
     """Creates a batch job and returns the batch ID."""
     batch = client.batches.create(
         input_file_id=input_file_id,
-        endpoint=BATCH_ENDPOINT,
+        endpoint=endpoint,
         completion_window="24h",
         metadata={
             "source_filename": source_file.name,
@@ -181,23 +194,9 @@ def download_file_content(client: OpenAI, file_id: str) -> str:
     return str(content)
 
 
-def process_one_jsonl_batch(client: OpenAI, path: Path) -> None:
-    """Processes one input JSONL file through the Batch API."""
-    logger.info(f"{path=}")
-    validate_batch_jsonl(path)
-
-    input_file_id = upload_batch_file(client=client, path=path)
-    logger.info(f"{input_file_id=}")
-
-    batch_id = create_batch(client=client, input_file_id=input_file_id, source_file=path)
-    logger.info(f"{batch_id=}")
-
-    batch = wait_for_batch(client=client, batch_id=batch_id)
-
-    batch_dir = OUTPUT_DIR / path.stem
-    batch_dir.mkdir(parents=True, exist_ok=True)
-
-    batch_summary = {
+def build_batch_summary(batch: object) -> dict[str, Any]:
+    """Builds a serializable summary dictionary for one batch."""
+    return {
         "id": batch.id,
         "status": batch.status,
         "input_file_id": batch.input_file_id,
@@ -206,11 +205,10 @@ def process_one_jsonl_batch(client: OpenAI, path: Path) -> None:
         "request_counts": getattr(batch, "request_counts", None),
         "metadata": getattr(batch, "metadata", None),
     }
-    save_text(
-        batch_dir / "batch_summary.json",
-        json.dumps(batch_summary, indent=2, default=str),
-    )
 
+
+def save_batch_outputs(client: OpenAI, batch: object, batch_dir: Path) -> None:
+    """Saves output and error files for one completed batch."""
     output_file_id = getattr(batch, "output_file_id", None)
     if output_file_id:
         output_text = download_file_content(client=client, file_id=output_file_id)
@@ -222,6 +220,39 @@ def process_one_jsonl_batch(client: OpenAI, path: Path) -> None:
         error_text = download_file_content(client=client, file_id=error_file_id)
         save_text(batch_dir / "errors.jsonl", error_text)
         logger.info(f"{error_file_id=}")
+
+
+def process_one_jsonl_batch(client: OpenAI, path: Path) -> None:
+    """Processes one input JSONL file through the Batch API."""
+    logger.info(f"{path=}")
+    records = validate_batch_jsonl(path)
+    endpoint = resolve_batch_endpoint(records=records, path=path)
+
+    input_file_id = upload_batch_file(client=client, path=path)
+    logger.info(f"{input_file_id=}")
+
+    batch_id = create_batch(
+        client=client,
+        input_file_id=input_file_id,
+        source_file=path,
+        endpoint=endpoint,
+    )
+    logger.info(f"{batch_id=}")
+
+    batch = wait_for_batch(client=client, batch_id=batch_id)
+    batch_dir = OUTPUT_DIR / path.stem
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    batch_summary = build_batch_summary(batch=batch)
+    save_text(
+        batch_dir / "batch_summary.json",
+        json.dumps(batch_summary, indent=2, default=str),
+    )
+
+    if batch.status == "completed":
+        save_batch_outputs(client=client, batch=batch, batch_dir=batch_dir)
+        return
+
+    logger.warning(f"{path=} {batch.status=}")
 
 
 def load_online_config() -> _OnlineConfig:
