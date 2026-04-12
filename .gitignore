@@ -209,3 +209,5 @@ __marimo__/
 skills/
 
 *.jsonl
+
+online_results/

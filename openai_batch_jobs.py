@@ -3,10 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import Any, NamedTuple
-from urllib.parse import urlparse
 
 import fire
 from loguru import logger
@@ -14,15 +14,12 @@ from openai import AsyncOpenAI, OpenAI
 
 
 INPUT_DIR = Path("data")
+BATCH_INPUT_DONE_DIR = Path("done")
 OUTPUT_DIR = Path("batch_results")
 ONLINE_OUTPUT_DIR = Path("online_results")
 POLL_INTERVAL_SECONDS = 30
-DEFAULT_ONLINE_CONCURRENCY = 256
+DEFAULT_ONLINE_CONCURRENCY = 32
 
-# Choose the endpoint that matches the requests inside each JSONL file.
-# For modern usage, /v1/responses is usually the best default.
-BATCH_ENDPOINT = "/v1/responses"
-BATCH_CHAT_COMPLETIONS = "/v1/chat/completions"
 DEFAULT_MODE = "batch"
 ONLINE_MODE = "online"
 
@@ -41,8 +38,6 @@ class _OnlineTask(NamedTuple):
 
     custom_id: str
     payload: dict[str, Any]
-    endpoint_url: str = BATCH_ENDPOINT
-    source_path: Path | None = None
 
 
 _QueueItem = _OnlineTask | None
@@ -54,7 +49,6 @@ class _OnlineOutcome(NamedTuple):
     custom_id: str
     response_json: str | None
     error: str | None
-    source_path: Path | None = None
 
 
 class _TaskBuildResult(NamedTuple):
@@ -63,6 +57,16 @@ class _TaskBuildResult(NamedTuple):
     tasks: list[_OnlineTask]
     invalid_outcomes: list[_OnlineOutcome]
     total_records: int
+
+
+def configure_logging() -> None:
+    """Configures process-wide logging using loguru."""
+    logger.remove()
+    logger.add(
+        sink=lambda message: print(message, end=""),
+        level="INFO",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{line} - {message}",
+    )
 
 
 def validate_mode(mode: str) -> None:
@@ -114,21 +118,37 @@ def load_jsonl_lines(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def validate_batch_jsonl(path: Path) -> None:
+def validate_batch_record(record: dict[str, Any], path: Path, line_number: int) -> None:
+    """Validates one batch JSONL record shape."""
+    if "custom_id" not in record:
+        raise ValueError(f"{path} line {line_number}: missing 'custom_id'")
+    if record.get("method") != "POST":
+        raise ValueError(f"{path} line {line_number}: expected method='POST'")
+    if "url" not in record:
+        raise ValueError(f"{path} line {line_number}: missing 'url'")
+    if "body" not in record or not isinstance(record["body"], dict):
+        raise ValueError(f"{path} line {line_number}: missing or invalid 'body'")
+
+
+def validate_batch_jsonl(path: Path) -> list[dict[str, Any]]:
     """Validates batch JSONL record shape before processing."""
     records = load_jsonl_lines(path)
     if not records:
         raise ValueError(f"{path} is empty.")
 
     for idx, record in enumerate(records, start=1):
-        if "custom_id" not in record:
-            raise ValueError(f"{path} line {idx}: missing 'custom_id'")
-        if record.get("method") != "POST":
-            raise ValueError(f"{path} line {idx}: expected method='POST'")
-        if "url" not in record:
-            raise ValueError(f"{path} line {idx}: missing 'url'")
-        if "body" not in record or not isinstance(record["body"], dict):
-            raise ValueError(f"{path} line {idx}: missing or invalid 'body'")
+        validate_batch_record(record=record, path=path, line_number=idx)
+    return records
+
+
+def resolve_batch_endpoint(records: list[dict[str, Any]], path: Path) -> str:
+    """Resolves a single endpoint value for a batch JSONL file."""
+    endpoints = {str(record["url"]) for record in records}
+    if len(endpoints) != 1:
+        raise ValueError(f"{path} must contain exactly one unique 'url' value.")
+    endpoint = endpoints.pop()
+    logger.info(f"{endpoint=}")
+    return endpoint
 
 
 def upload_batch_file(client: OpenAI, path: Path) -> str:
@@ -141,11 +161,13 @@ def upload_batch_file(client: OpenAI, path: Path) -> str:
     return uploaded.id
 
 
-def create_batch(client: OpenAI, input_file_id: str, source_file: Path) -> str:
+def create_batch(
+    client: OpenAI, input_file_id: str, source_file: Path, endpoint: str
+) -> str:
     """Creates a batch job and returns the batch ID."""
     batch = client.batches.create(
         input_file_id=input_file_id,
-        endpoint=BATCH_ENDPOINT,
+        endpoint=endpoint,
         completion_window="24h",
         metadata={
             "source_filename": source_file.name,
@@ -176,25 +198,9 @@ def download_file_content(client: OpenAI, file_id: str) -> str:
     return str(content)
 
 
-def process_one_jsonl_batch(client: OpenAI, path: Path) -> None:
-    """Processes one input JSONL file through the Batch API."""
-    logger.info(f"{path=}")
-    validate_batch_jsonl(path)
-
-    input_file_id = upload_batch_file(client=client, path=path)
-    logger.info(f"{input_file_id=}")
-
-    batch_id = create_batch(
-        client=client, input_file_id=input_file_id, source_file=path
-    )
-    logger.info(f"{batch_id=}")
-
-    batch = wait_for_batch(client=client, batch_id=batch_id)
-
-    batch_dir = OUTPUT_DIR / path.stem
-    batch_dir.mkdir(parents=True, exist_ok=True)
-
-    batch_summary = {
+def build_batch_summary(batch: object) -> dict[str, Any]:
+    """Builds a serializable summary dictionary for one batch."""
+    return {
         "id": batch.id,
         "status": batch.status,
         "input_file_id": batch.input_file_id,
@@ -203,15 +209,41 @@ def process_one_jsonl_batch(client: OpenAI, path: Path) -> None:
         "request_counts": getattr(batch, "request_counts", None),
         "metadata": getattr(batch, "metadata", None),
     }
-    save_text(
-        batch_dir / "batch_summary.json",
-        json.dumps(batch_summary, indent=2, default=str),
-    )
 
+
+def resolve_done_destination(done_dir: Path, filename: str) -> Path:
+    """Returns a non-colliding path under the done directory for a filename."""
+    destination = done_dir / filename
+    if not destination.exists():
+        return destination
+
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    counter = 1
+    while True:
+        candidate = done_dir / f"{stem}_{counter}{suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def move_batch_input_to_done(source: Path) -> None:
+    """Moves a processed batch JSONL input file into the top-level done folder."""
+    BATCH_INPUT_DONE_DIR.mkdir(parents=True, exist_ok=True)
+    destination = resolve_done_destination(
+        done_dir=BATCH_INPUT_DONE_DIR,
+        filename=source.name,
+    )
+    shutil.move(src=str(source), dst=str(destination))
+    logger.info(f"{source=} {destination=}")
+
+
+def save_batch_outputs(client: OpenAI, batch: object, batch_dir: Path) -> None:
+    """Saves output and error files for one completed batch."""
     output_file_id = getattr(batch, "output_file_id", None)
     if output_file_id:
         output_text = download_file_content(client=client, file_id=output_file_id)
-        save_text(batch_dir / "output.jsonl", output_text)
+        save_text(batch_dir / f"batch_{output_file_id}_output.jsonl", output_text)
         logger.info(f"{output_file_id=}")
 
     error_file_id = getattr(batch, "error_file_id", None)
@@ -219,6 +251,41 @@ def process_one_jsonl_batch(client: OpenAI, path: Path) -> None:
         error_text = download_file_content(client=client, file_id=error_file_id)
         save_text(batch_dir / "errors.jsonl", error_text)
         logger.info(f"{error_file_id=}")
+
+
+def process_one_jsonl_batch(client: OpenAI, path: Path) -> None:
+    """Processes one input JSONL file through the Batch API."""
+    logger.info(f"{path=}")
+    records = validate_batch_jsonl(path)
+    endpoint = resolve_batch_endpoint(records=records, path=path)
+
+    input_file_id = upload_batch_file(client=client, path=path)
+    logger.info(f"{input_file_id=}")
+
+    batch_id = create_batch(
+        client=client,
+        input_file_id=input_file_id,
+        source_file=path,
+        endpoint=endpoint,
+    )
+    logger.info(f"{batch_id=}")
+
+    batch = wait_for_batch(client=client, batch_id=batch_id)
+    batch_dir = OUTPUT_DIR / path.stem
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    # batch_summary = build_batch_summary(batch=batch)
+    # save_text(
+    #     batch_dir / "batch_summary.json",
+    #     json.dumps(batch_summary, indent=2, default=str),
+    # )
+
+    if batch.status == "completed":
+        save_batch_outputs(client=client, batch=batch, batch_dir=batch_dir)
+        move_batch_input_to_done(source=path)
+        return
+
+    logger.warning(f"{path=} {batch.status=}")
+    move_batch_input_to_done(source=path)
 
 
 def load_online_config() -> _OnlineConfig:
@@ -264,30 +331,8 @@ def parse_concurrency(concurrency_text: str | None) -> int:
     return concurrency
 
 
-def normalize_batch_api_path(url: str) -> str:
-    """Normalizes a batch JSONL `url` field to a path like /v1/chat/completions."""
-    text = url.strip()
-    if text.startswith(("http://", "https://")):
-        parsed = urlparse(text)
-        path = parsed.path or "/"
-        trimmed = path.rstrip("/")
-        return trimmed if trimmed else "/"
-    if not text.startswith("/"):
-        text = f"/{text}"
-    trimmed = text.rstrip("/")
-    return trimmed if trimmed else "/"
-
-
-def endpoint_url_from_record(record: dict[str, Any]) -> str:
-    """Returns the normalized API path from a batch JSONL record."""
-    raw = record.get("url")
-    if isinstance(raw, str) and raw.strip():
-        return normalize_batch_api_path(raw)
-    return normalize_batch_api_path(BATCH_ENDPOINT)
-
-
 def make_online_request_body(record: dict[str, Any], model: str) -> dict[str, Any]:
-    """Creates the HTTP JSON body for the record's `url` (chat or responses)."""
+    """Creates a Responses API payload from a batch JSONL record."""
     body = record.get("body")
     if not isinstance(body, dict):
         raise ValueError("Each JSONL record must include a 'body' dictionary.")
@@ -297,11 +342,7 @@ def make_online_request_body(record: dict[str, Any], model: str) -> dict[str, An
     return payload
 
 
-def build_online_tasks(
-    records: list[dict[str, Any]],
-    model: str,
-    source_path: Path | None = None,
-) -> _TaskBuildResult:
+def build_online_tasks(records: list[dict[str, Any]], model: str) -> _TaskBuildResult:
     """Builds tasks for online execution and tracks invalid records."""
     tasks: list[_OnlineTask] = []
     invalid_outcomes: list[_OnlineOutcome] = []
@@ -312,23 +353,11 @@ def build_online_tasks(
             payload = make_online_request_body(record=record, model=model)
         except Exception as exc:  # pylint: disable=broad-except
             invalid_outcomes.append(
-                _OnlineOutcome(
-                    custom_id=custom_id,
-                    response_json=None,
-                    error=str(exc),
-                    source_path=source_path,
-                )
+                _OnlineOutcome(custom_id=custom_id, response_json=None, error=str(exc))
             )
             logger.exception(f"{custom_id=} {exc=}")
             continue
-        tasks.append(
-            _OnlineTask(
-                custom_id=custom_id,
-                payload=payload,
-                endpoint_url=endpoint_url_from_record(record=record),
-                source_path=source_path,
-            )
-        )
+        tasks.append(_OnlineTask(custom_id=custom_id, payload=payload))
 
     return _TaskBuildResult(
         tasks=tasks,
@@ -350,41 +379,20 @@ def build_online_queue(
 
 
 async def execute_online_task(client: AsyncOpenAI, task: _OnlineTask) -> _OnlineOutcome:
-    """Executes one online task using the same API as the JSONL `url` field."""
-    path = normalize_batch_api_path(task.endpoint_url)
-    if path == BATCH_CHAT_COMPLETIONS:
-        api_call = client.chat.completions.create(**task.payload)
-    elif path == normalize_batch_api_path(BATCH_ENDPOINT):
-        api_call = client.responses.create(**task.payload)
-    else:
-        err = (
-            f"Unsupported batch url for online mode: {task.endpoint_url!r} "
-            f"(normalized={path!r}); supported: {BATCH_CHAT_COMPLETIONS!r}, "
-            f"{BATCH_ENDPOINT!r}"
-        )
-        logger.info(f"{task.custom_id=} {err=}")
-        return _OnlineOutcome(
-            custom_id=task.custom_id,
-            response_json=None,
-            error=err,
-            source_path=task.source_path,
-        )
-
+    """Executes one online task."""
     try:
-        response = await api_call
+        response = await client.responses.create(**task.payload)
         response_json = response.model_dump_json()
         return _OnlineOutcome(
             custom_id=task.custom_id,
             response_json=response_json,
             error=None,
-            source_path=task.source_path,
         )
     except Exception as exc:  # pylint: disable=broad-except
         return _OnlineOutcome(
             custom_id=task.custom_id,
             response_json=None,
             error=str(exc),
-            source_path=task.source_path,
         )
 
 
@@ -493,9 +501,7 @@ async def process_one_jsonl_online(
     """Processes one JSONL file with concurrent online Responses API calls."""
     logger.info(f"{path=} {concurrency=}")
     records = load_jsonl_lines(path)
-    task_build_result = build_online_tasks(
-        records=records, model=model, source_path=path
-    )
+    task_build_result = build_online_tasks(records=records, model=model)
 
     outcomes = await execute_online_tasks(
         client=client,
@@ -524,16 +530,8 @@ def run_batch_mode(jsonl_files: list[Path]) -> None:
             logger.exception(f"{path=} {exc=}")
 
 
-def outcomes_for_source_file(
-    outcomes: list[_OnlineOutcome],
-    source_path: Path,
-) -> list[_OnlineOutcome]:
-    """Returns outcomes that belong to one input JSONL file."""
-    return [o for o in outcomes if o.source_path == source_path]
-
-
 async def run_online_mode_async(jsonl_files: list[Path]) -> None:
-    """Runs all JSONL rows through one shared online worker pool (row-level concurrency)."""
+    """Runs all files through concurrent online request mode."""
     ONLINE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     online_config = load_online_config()
     logger.info(f"{online_config.base_url=}")
@@ -545,53 +543,13 @@ async def run_online_mode_async(jsonl_files: list[Path]) -> None:
         base_url=online_config.base_url,
     )
 
-    all_tasks: list[_OnlineTask] = []
-    invalid_outcomes: list[_OnlineOutcome] = []
-    total_records_by_path: dict[Path, int] = {}
-
     for path in jsonl_files:
         try:
-            records = load_jsonl_lines(path)
-            built = build_online_tasks(
-                records=records,
-                model=online_config.model,
-                source_path=path,
-            )
-            all_tasks.extend(built.tasks)
-            invalid_outcomes.extend(built.invalid_outcomes)
-            total_records_by_path[path] = built.total_records
-            logger.info(
-                f"{path=} {built.total_records=} {len(built.tasks)=} "
-                f"{len(built.invalid_outcomes)=}"
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.exception(f"{path=} {exc=}")
-
-    try:
-        api_outcomes = await execute_online_tasks(
-            client=client,
-            tasks=all_tasks,
-            concurrency=online_config.concurrency,
-        )
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.exception(f"{exc=}")
-        api_outcomes = []
-
-    combined_outcomes = invalid_outcomes + api_outcomes
-
-    for path in jsonl_files:
-        if path not in total_records_by_path:
-            continue
-        try:
-            file_outcomes = outcomes_for_source_file(
-                outcomes=combined_outcomes,
-                source_path=path,
-            )
-            save_online_results(
+            await process_one_jsonl_online(
+                client=client,
                 path=path,
-                outcomes=file_outcomes,
                 model=online_config.model,
-                total_requests=total_records_by_path[path],
+                concurrency=online_config.concurrency,
             )
         except Exception as exc:  # pylint: disable=broad-except
             logger.exception(f"{path=} {exc=}")
@@ -599,12 +557,13 @@ async def run_online_mode_async(jsonl_files: list[Path]) -> None:
     await client.close()
 
 
-def run(mode: str = ONLINE_MODE) -> None:
+def run(mode: str = DEFAULT_MODE) -> None:
     """Runs batch jobs in batch or online mode.
 
     Args:
         mode: Execution mode, either "batch" or "online".
     """
+    configure_logging()
     validate_mode(mode=mode)
     logger.info(f"{mode=}")
 
