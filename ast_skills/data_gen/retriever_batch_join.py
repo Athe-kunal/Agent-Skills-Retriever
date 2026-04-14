@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, NamedTuple
 
@@ -22,6 +21,7 @@ from ast_skills.data_gen.dataset import (
     skill_md_record_row_to_fields,
 )
 from ast_skills.data_gen.synthetic_data_gen import SkillMdExtraction
+from ast_skills.retriever.datamodels import RetrieverDataModel
 
 _SKILL_MD_BLOCK_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"----- SKILL\.md markdown -----\s*(.*?)\s*----- end -----",
@@ -39,25 +39,6 @@ class RedoBatchExportResult(NamedTuple):
     missing_output_count: int
     invalid_extraction_count: int
     total_rows_written: int
-
-
-@dataclass(frozen=True)
-class RetrieverDataModel:
-    """One retriever training row: SKILL.md source plus structured extraction.
-
-    ``metadata`` is only the coerced ``metadata`` object from the matching
-    ``skill_md_records.jsonl`` row (empty dict when disabled or missing).
-    """
-
-    custom_id: str
-    markdown_content: str
-    reasoning: str
-    what: str
-    why: str
-    seed_questions: str
-    name: str
-    description: str
-    metadata: dict[str, str]
 
 
 def _iter_jsonl_files(directory: Path) -> list[Path]:
