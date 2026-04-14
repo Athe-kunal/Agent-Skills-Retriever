@@ -19,6 +19,7 @@ from ast_skills.data_gen.dataset import (
     index_rows_by_custom_id,
     messages_from_batch_input_row,
     read_jsonl,
+    skill_md_record_row_to_fields,
 )
 from ast_skills.data_gen.synthetic_data_gen import SkillMdExtraction
 
@@ -26,6 +27,9 @@ _SKILL_MD_BLOCK_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"----- SKILL\.md markdown -----\s*(.*?)\s*----- end -----",
     re.DOTALL,
 )
+
+_REPO_ROOT: Final[Path] = Path(__file__).resolve().parent.parent.parent
+_DEFAULT_SKILL_MD_RECORDS: Final[Path] = _REPO_ROOT / "skill_md_records.jsonl"
 
 
 class RedoBatchExportResult(NamedTuple):
@@ -39,7 +43,11 @@ class RedoBatchExportResult(NamedTuple):
 
 @dataclass(frozen=True)
 class RetrieverDataModel:
-    """One retriever training row: SKILL.md source plus structured extraction."""
+    """One retriever training row: SKILL.md source plus structured extraction.
+
+    ``metadata`` is only the coerced ``metadata`` object from the matching
+    ``skill_md_records.jsonl`` row (empty dict when disabled or missing).
+    """
 
     custom_id: str
     markdown_content: str
@@ -71,17 +79,6 @@ def _read_jsonl_rows(paths: list[Path]) -> list[dict[str, Any]]:
     return rows
 
 
-def _path_source_for_custom_id(paths: list[Path]) -> dict[str, str]:
-    """Map each ``custom_id`` to the last JSONL path that contained it."""
-    by_id: dict[str, str] = {}
-    for path in paths:
-        for row in read_jsonl(path):
-            custom_id = row.get("custom_id")
-            if isinstance(custom_id, str) and custom_id:
-                by_id[custom_id] = str(path)
-    return by_id
-
-
 def extract_skill_markdown_from_done_row(row: dict[str, Any]) -> str:
     """Return the SKILL.md markdown body from a batch input JSONL row."""
     messages = messages_from_batch_input_row(row)
@@ -103,64 +100,42 @@ def extract_skill_markdown_from_done_row(row: dict[str, Any]) -> str:
     return user_text.strip()
 
 
-def _metadata_for_row(
-    *,
-    custom_id: str,
-    done_row: dict[str, Any],
-    output_row: dict[str, Any],
-    done_source_path: str,
-    output_source_path: str,
-    extraction: SkillMdExtraction,
-) -> dict[str, str]:
-    """Normalize join context to ``dict[str, str]`` for downstream consumers."""
-    body = done_row.get("body")
-    input_model = ""
-    if isinstance(body, dict):
-        model = body.get("model")
-        if isinstance(model, str):
-            input_model = model
+def _skill_md_record_metadata_only(record_row: dict[str, Any] | None) -> dict[str, str]:
+    """Coerced ``metadata`` from a ``skill_md_records`` row, or empty when missing."""
+    if record_row is None:
+        return {}
+    _, _, skill_metadata = skill_md_record_row_to_fields(record_row)
+    return dict(skill_metadata)
 
-    status_code = ""
-    response_model = ""
-    completion_id = ""
-    batch_row_id = ""
-    request_id = ""
-    if isinstance(output_row.get("id"), str):
-        batch_row_id = output_row["id"]
-    response = output_row.get("response")
-    if isinstance(response, dict):
-        status = response.get("status_code")
-        status_code = str(status) if status is not None else ""
-        request_raw = response.get("request_id")
-        if isinstance(request_raw, str):
-            request_id = request_raw
-        resp_body = response.get("body")
-        if isinstance(resp_body, dict):
-            rid = resp_body.get("id")
-            if isinstance(rid, str):
-                completion_id = rid
-            m = resp_body.get("model")
-            if isinstance(m, str):
-                response_model = m
 
-    err = output_row.get("error")
-    error_summary = ""
-    if err is not None:
-        error_summary = json.dumps(err, ensure_ascii=False, sort_keys=True, default=str)
+def _read_jsonl_dict_rows_lenient(path: Path) -> list[dict[str, Any]]:
+    """Like ``read_jsonl`` but skips bad lines with a warning instead of failing."""
+    rows: list[dict[str, Any]] = []
+    with path.open(encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj: Any = json.loads(line)
+            except json.JSONDecodeError as exc:
+                log.warning(f"{path=} {line_no=} {exc=}")
+                continue
+            if isinstance(obj, dict):
+                rows.append(obj)
+            else:
+                log.warning(f"{path=} {line_no=} expected dict, got {type(obj)=}")
+    return rows
 
-    return {
-        "custom_id": custom_id,
-        "done_jsonl": done_source_path,
-        "batch_output_jsonl": output_source_path,
-        "batch_row_id": batch_row_id,
-        "request_id": request_id,
-        "completion_id": completion_id,
-        "input_model": input_model,
-        "response_status_code": status_code,
-        "response_model": response_model,
-        "seed_question_count": str(len(extraction.seed_questions)),
-        "batch_error": error_summary,
-    }
+
+def _load_skill_md_records_by_custom_id(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.is_file():
+        log.warning(f"skill_md_records file missing or not a file: {path=}")
+        return {}
+    rows = _read_jsonl_dict_rows_lenient(path)
+    by_id = index_rows_by_custom_id(rows)
+    log.info(f"{path=}, {len(rows)=}, {len(by_id)=}")
+    return by_id
 
 
 def build_retriever_data_models(
@@ -168,6 +143,8 @@ def build_retriever_data_models(
     batch_results_dir: Path,
     *,
     require_batch_output: bool = True,
+    skill_md_records_path: Path | None = None,
+    load_skill_md_records: bool = True,
 ) -> list[RetrieverDataModel]:
     """
     Load all ``done/*.jsonl`` inputs and all ``batch_results/**/*.jsonl`` outputs,
@@ -176,6 +153,13 @@ def build_retriever_data_models(
 
     If ``require_batch_output`` is True, only ``custom_id`` values present in both
     sides with a parseable assistant JSON payload are returned.
+
+    ``RetrieverDataModel.metadata`` is **only** the coerced ``metadata`` object from
+    ``skill_md_records.jsonl`` (matched on ``custom_id``). When ``load_skill_md_records`` is
+    False, or no record exists for an id, ``metadata`` is ``{}``.
+
+    If ``skill_md_records_path`` is ``None``, the default is the repository root file
+    ``skill_md_records.jsonl``.
     """
     done_paths = _iter_jsonl_files(done_dir)
     output_paths = _iter_jsonl_files_recursive(batch_results_dir)
@@ -185,8 +169,17 @@ def build_retriever_data_models(
 
     done_by_id = index_rows_by_custom_id(done_rows)
     output_by_id = index_rows_by_custom_id(output_rows)
-    done_path_by_id = _path_source_for_custom_id(done_paths)
-    output_path_by_id = _path_source_for_custom_id(output_paths)
+
+    records_path = (
+        skill_md_records_path
+        if skill_md_records_path is not None
+        else _DEFAULT_SKILL_MD_RECORDS
+    )
+    records_by_id: dict[str, dict[str, Any]] = {}
+    if load_skill_md_records:
+        records_by_id = _load_skill_md_records_by_custom_id(records_path)
+    else:
+        log.info("skill_md_records merge disabled (load_skill_md_records=False)")
 
     log.info(
         f"{len(done_rows)=}, {len(output_rows)=}, {len(done_by_id)=}, {len(output_by_id)=}"
@@ -195,6 +188,7 @@ def build_retriever_data_models(
     models: list[RetrieverDataModel] = []
     missing_output = 0
     invalid_extraction = 0
+    missing_record = 0
     for custom_id in sorted(done_by_id.keys()):
         done_row = done_by_id[custom_id]
         output_row = output_by_id.get(custom_id)
@@ -211,18 +205,13 @@ def build_retriever_data_models(
                 invalid_extraction += 1
             continue
 
-        done_source = done_path_by_id.get(custom_id, "")
-        output_source = (
-            output_path_by_id.get(custom_id, "") if output_row is not None else ""
-        )
-
-        metadata = _metadata_for_row(
-            custom_id=custom_id,
-            done_row=done_row,
-            output_row=output_row if output_row is not None else {},
-            done_source_path=done_source,
-            output_source_path=output_source,
-            extraction=extraction,
+        record_row = records_by_id.get(custom_id)
+        if load_skill_md_records and record_row is None:
+            missing_record += 1
+        metadata = (
+            _skill_md_record_metadata_only(record_row)
+            if load_skill_md_records
+            else {}
         )
 
         models.append(
@@ -240,7 +229,7 @@ def build_retriever_data_models(
         )
 
     log.info(
-        f"{len(models)=}, {missing_output=}, {invalid_extraction=}"
+        f"{len(models)=}, {missing_output=}, {invalid_extraction=}, {missing_record=}"
     )
     return models
 
