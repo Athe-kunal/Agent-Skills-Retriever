@@ -54,7 +54,7 @@ class RetrieverDataModel:
     reasoning: str
     what: str
     why: str
-    seed_questions: str
+    seed_questions: list[str]
     name: str
     description: str
     metadata: dict[str, str]
@@ -221,9 +221,7 @@ def build_retriever_data_models(
                 reasoning=extraction.reasoning,
                 what=extraction.what,
                 why=extraction.why,
-                seed_questions=json.dumps(
-                    extraction.seed_questions, ensure_ascii=False
-                ),
+                seed_questions=extraction.seed_questions,
                 name=metadata.get("name", ""),
                 description=metadata.get("description", ""),
                 metadata=metadata,
