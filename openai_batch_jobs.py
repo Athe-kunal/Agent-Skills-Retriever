@@ -11,6 +11,7 @@ from typing import Any, NamedTuple
 import fire
 from loguru import logger
 from openai import AsyncOpenAI, OpenAI
+from openai.types import Batch
 
 
 INPUT_DIR = Path("data")
@@ -177,6 +178,10 @@ def create_batch(
     return batch.id
 
 
+TERMINAL_STATUSES = {"completed", "failed", "expired", "cancelled"}
+ACTIVE_STATUSES = {"validating", "in_progress", "finalizing", "cancelling"}
+
+
 def wait_for_batch(client: OpenAI, batch_id: str) -> object:
     """Polls a batch job until it reaches a terminal state."""
     while True:
@@ -184,9 +189,34 @@ def wait_for_batch(client: OpenAI, batch_id: str) -> object:
         status = batch.status
         logger.info(f"{batch_id=} {status=}")
 
-        if status in {"completed", "failed", "expired", "cancelled"}:
+        if status in TERMINAL_STATUSES:
             return batch
 
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+
+def fetch_active_batches(client: OpenAI) -> list[Batch]:
+    """Returns all batch jobs currently in a non-terminal state."""
+    active: list[Batch] = []
+    for batch in client.batches.list():
+        if batch.status in ACTIVE_STATUSES:
+            active.append(batch)
+    return active
+
+
+def wait_until_no_active_batches(client: OpenAI) -> None:
+    """Blocks until OpenAI reports no batch jobs in a non-terminal state.
+
+    This prevents submitting a new job while a previous one is still running,
+    even across separate script invocations or concurrent runs.
+    """
+    while True:
+        active = fetch_active_batches(client=client)
+        if not active:
+            return
+
+        active_ids = [b.id for b in active]
+        logger.info(f"Waiting for active batches to finish: {active_ids=}")
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
@@ -258,6 +288,8 @@ def process_one_jsonl_batch(client: OpenAI, path: Path) -> None:
     logger.info(f"{path=}")
     records = validate_batch_jsonl(path)
     endpoint = resolve_batch_endpoint(records=records, path=path)
+
+    wait_until_no_active_batches(client=client)
 
     input_file_id = upload_batch_file(client=client, path=path)
     logger.info(f"{input_file_id=}")
