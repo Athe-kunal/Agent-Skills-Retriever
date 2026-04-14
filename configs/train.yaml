@@ -1,0 +1,32 @@
+train:
+  dataset_jsonl: artifacts/retriever_models_summary.jsonl
+  output_dir: artifacts/sentence_transformers/qwen3-summary
+  base_model_name: Qwen/Qwen3-Embedding-0.6B
+  epochs: 3
+  batch_size: 32
+  learning_rate: 2.0e-5
+  warmup_steps: 200
+  seed: 13
+  hard_negative_pool_size: 64
+  dense_weight: 1.0
+  sparse_weight: 1.0
+  mining_backend: bi_encoder
+  eval_backend: bi_encoder
+  query_instruction: ""
+  eval_instruction: ""
+  wandb_project: ast-skills-retriever
+  wandb_entity: ""
+  run_name: qwen3-summary-train
+
+evaluate:
+  dataset_jsonl: artifacts/retriever_models_summary.jsonl
+  retrieval_backend: bi_encoder
+  retrieval_model: artifacts/sentence_transformers/qwen3-summary
+  query_instruction: ""
+  document_instruction: ""
+  wandb_project: ast-skills-retriever
+  wandb_entity: ""
+  run_name: retriever-baseline-eval
+  vllm_base_url: http://127.0.0.1:8000/v1
+  vllm_api_key: EMPTY
+  vllm_batch_size: 64

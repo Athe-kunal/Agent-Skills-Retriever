@@ -11,6 +11,9 @@ FIELD ?= description
 TOP_K ?= 10
 QUERY ?= example query
 
+TRAIN_CONFIG_PATH ?= configs/train.yaml
+EVAL_CONFIG_PATH ?= configs/train.yaml
+
 .PHONY: vllm-embd-serve
 vllm-embd-serve:
 	CUDA_VISIBLE_DEVICES=$(GPU_DEVICE) uv run vllm serve $(EMBD_MODEL) \
@@ -48,3 +51,13 @@ retriever-search-sparse:
 .PHONY: retriever-search-hybrid
 retriever-search-hybrid:
 	uv run python -m ast_skills.retriever.search hybrid --query "$(QUERY)" --field $(FIELD) --root_dir $(CHROMA_ROOT) --embedding_base_url $(EMBD_BASE_URL) --embedding_model $(EMBD_MODEL) --api_key $(EMBD_API_KEY) --limit $(TOP_K)
+
+.PHONY: retriever-train
+retriever-train:
+	uv run python -m ast_skills.retriever.train_sentence_transformer train_from_config \
+		--config_path $(TRAIN_CONFIG_PATH)
+
+.PHONY: retriever-evaluate
+retriever-evaluate:
+	uv run python -m ast_skills.retriever.evaluate_retriever evaluate_from_config \
+		--config_path $(EVAL_CONFIG_PATH)
