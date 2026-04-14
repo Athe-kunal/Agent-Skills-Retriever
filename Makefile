@@ -7,10 +7,10 @@ EMBD_BASE_URL ?= http://127.0.0.1:$(EMBD_PORT)/v1
 EMBD_API_KEY ?= EMPTY
 RETRIEVER_JSONL ?= artifacts/summary_retriever_models.jsonl
 CHROMA_ROOT ?= artifacts/chroma
-ONLY_FIELDS ?= summary
-FIELD ?= description
+ONLY_FIELDS ?= description
+FIELD ?= summary
 TOP_K ?= 10
-QUERY ?= example query
+QUERY ?= I want to read pdf 
 
 TRAIN_CONFIG_PATH ?= configs/train.yaml
 EVAL_CONFIG_PATH ?= configs/train.yaml

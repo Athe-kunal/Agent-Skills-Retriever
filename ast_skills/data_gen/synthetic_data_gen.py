@@ -474,6 +474,34 @@ def write_openai_batch_skill_md_summary_jsonl(
     )
 
 
+def has_required_metadata(record: SkillMdRecord) -> bool:
+    """Return True only when both name and description are non-empty strings."""
+    return bool(record.metadata.get("name")) and bool(
+        record.metadata.get("description")
+    )
+
+
+def filter_records_with_metadata(records: list[SkillMdRecord]) -> list[SkillMdRecord]:
+    """
+    Drop records whose name or description metadata is missing or empty.
+
+    Logs each skipped record so the caller can audit what was removed.
+    """
+    kept: list[SkillMdRecord] = []
+    for record in records:
+        if has_required_metadata(record):
+            kept.append(record)
+        else:
+            name = record.metadata.get("name", "")
+            description = record.metadata.get("description", "")
+            logger.warning(
+                f"Skipping record with missing metadata: {record.relative_path=} {name=} {description=}"
+            )
+
+    logger.info(f"Records kept: {len(kept)} / {len(records)} total")
+    return kept
+
+
 class SyntheticDataGenCli:
     """Entry point for `python synthetic_data_gen.py <command> ...` via python-fire."""
 
@@ -540,6 +568,9 @@ class SyntheticDataGenCli:
         logger.info(f"{skills_root=}")
         records = collect_english_skill_md_records(skills_root)
         logger.info(f"{len(records)=}")
+
+        records = filter_records_with_metadata(records)
+
         if max_records is not None:
             records = records[:max_records]
             logger.info(f"{max_records=}")

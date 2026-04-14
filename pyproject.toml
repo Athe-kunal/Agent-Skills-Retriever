@@ -26,8 +26,13 @@ dependencies = [
     "umap-learn>=0.5.12",
 ]
 
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
 [dependency-groups]
 dev = [
     "ipykernel>=7.2.0",
     "nvitop>=1.6.2",
+    "pytest>=9.0.3",
 ]

@@ -49,8 +49,18 @@ encoding = tiktoken.encoding_for_model("gpt-4o-mini")  # or similar
 
 threshold = 63_000
 
-# Leading YAML block: --- ... --- then body (Agent Skills / Cursor convention).
-_FRONTMATTER_RE = re.compile(r"\A---\s*\r?\n(.*?)\r?\n---\s*\r?\n", re.DOTALL)
+# Fenced frontmatter with both delimiters: --- ... ---
+_FRONTMATTER_BOTH_RE = re.compile(r"\A---\s*\r?\n(.*?)\r?\n---\s*(?:\r?\n|$)", re.DOTALL)
+# Fenced frontmatter with only the opening ---  (no closing delimiter found)
+_FRONTMATTER_OPEN_RE = re.compile(r"\A---\s*\r?\n(.*)", re.DOTALL)
+# Direct key extraction: value runs until the next bare "key:" line, a "---"
+# delimiter, or end of string.  The \n--- guard prevents bleeding into fenced
+# block delimiters when the regex is applied to the full raw text.
+_NAME_RE = re.compile(r"^name:\s*(.+)$", re.MULTILINE)
+_DESCRIPTION_RE = re.compile(
+    r"^description:\s*(.*?)(?=\n\w[\w -]*:|\n---|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
 # Lone surrogates cannot be encoded to UTF-8 for JSONL output.
 _SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 
@@ -133,33 +143,103 @@ def _metadata_value_to_str(value: object) -> str:
     return str(value)
 
 
-def parse_skill_md_frontmatter(raw_text: str) -> tuple[dict[str, str], str]:
+def _extract_fenced_block(text: str) -> tuple[str, str]:
     """
-    Split SKILL.md into frontmatter metadata (--- ... ---) and markdown body.
+    Return (yaml_block, body) for a fenced --- frontmatter.
 
-    All keys from the YAML block are stored in metadata with string values
-    (nested structures are JSON-encoded). name and description are always
-    present (empty string if missing).
+    Handles three cases:
+      - Both opening and closing ``---`` present → yaml_block is the content
+        between them; body is everything after the closing delimiter.
+      - Only the opening ``---`` present → yaml_block is everything after it;
+        body is empty.
+      - No ``---`` at all → both are empty strings.
     """
-    text = raw_text.lstrip("\ufeff")
-    match = _FRONTMATTER_RE.match(text)
-    if not match:
-        body = text
-        meta: dict[str, str] = {"name": "", "description": ""}
-        return meta, body
+    match = _FRONTMATTER_BOTH_RE.match(text)
+    if match:
+        return match.group(1), text[match.end() :]
 
-    frontmatter_block = match.group(1)
-    body = text[match.end() :]
+    match = _FRONTMATTER_OPEN_RE.match(text)
+    if match:
+        return match.group(1), ""
 
+    return "", ""
+
+
+def _parse_yaml_block(yaml_text: str) -> dict[str, str]:
+    """
+    Parse a YAML string into a dict[str, str].
+
+    Returns an empty dict on parse failure or if the result is not a mapping.
+    """
     try:
-        loaded = yaml.safe_load(frontmatter_block)
+        loaded = yaml.safe_load(yaml_text)
     except yaml.YAMLError:
-        loaded = None
+        return {}
 
     if not isinstance(loaded, dict):
-        meta = {}
+        return {}
+
+    return {str(key): _metadata_value_to_str(val) for key, val in loaded.items()}
+
+
+def _extract_name(text: str) -> str:
+    """Return the value of the first ``name:`` line, or empty string."""
+    match = _NAME_RE.search(text)
+    return match.group(1).strip() if match else ""
+
+
+def _extract_description(text: str) -> str:
+    """
+    Return the value of the first ``description:`` field.
+
+    The value continues until the next bare ``key:`` line or end of string,
+    so multi-line descriptions are captured correctly.
+    """
+    match = _DESCRIPTION_RE.search(text)
+    return match.group(1).strip() if match else ""
+
+
+def parse_skill_md_frontmatter(raw_text: str) -> tuple[dict[str, str], str]:
+    """
+    Split SKILL.md into frontmatter metadata and markdown body.
+
+    Strategy:
+      1. ``name`` and ``description`` are always extracted directly by regex so
+         they are found even when no ``---`` delimiters exist.
+      2. All other metadata keys come from the fenced ``---`` / ``---`` block
+         when present (missing closing delimiter is tolerated).
+      3. The body is whatever follows the closing ``---``; empty if the closing
+         delimiter was absent.
+
+    All values are stored as strings (nested YAML structures are JSON-encoded).
+    ``name`` and ``description`` are always present (empty string if missing).
+    """
+    text = raw_text.lstrip("\ufeff")
+
+    yaml_block, body = _extract_fenced_block(text)
+
+    if yaml_block:
+        # Fenced block found — parse it for all keys; body is what follows.
+        meta = _parse_yaml_block(yaml_block)
     else:
-        meta = {str(key): _metadata_value_to_str(val) for key, val in loaded.items()}
+        # No --- delimiters — try parsing the whole text as raw YAML to pick
+        # up extra keys (version, author, …) beyond name / description.
+        meta = _parse_yaml_block(text)
+        if meta:
+            body = ""
+        else:
+            # Pure markdown: no structured metadata found at all.
+            body = text
+
+    # Direct regex extraction always wins for name / description — it tolerates
+    # malformed YAML and files without --- delimiters.
+    name = _extract_name(text)
+    description = _extract_description(text)
+
+    if name:
+        meta["name"] = name
+    if description:
+        meta["description"] = description
 
     meta.setdefault("name", "")
     meta.setdefault("description", "")
