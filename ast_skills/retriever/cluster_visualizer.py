@@ -33,6 +33,7 @@ class _EmbeddingFrameResult(NamedTuple):
 DB_CONFIGS: tuple[_DbConfig, ...] = (
     _DbConfig("what", "what_db", "retriever_what"),
     _DbConfig("why", "why_db", "retriever_why"),
+    _DbConfig("summary", "summary_db", "retriever_summary"),
     _DbConfig("description", "description_db", "retriever_description"),
 )
 

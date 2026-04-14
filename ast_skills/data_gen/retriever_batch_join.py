@@ -19,10 +19,14 @@ from ast_skills.data_gen.dataset import (
     messages_from_batch_input_row,
     read_jsonl,
     skill_md_record_row_to_fields,
+    summary_extraction_from_batch_output_row,
 )
-from ast_skills.data_gen.datamodels import RetrieverDataModel
-from ast_skills.data_gen.synthetic_data_gen import SkillMdExtraction
-from ast_skills.retriever.datamodels import RetrieverDataModel
+from ast_skills.data_gen.datamodels import (
+    RetrieverDataModel,
+    SkillMdExtraction,
+    SkillMdSummaryExtraction,
+    SummaryRetrieverDataModel,
+)
 
 _SKILL_MD_BLOCK_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"----- SKILL\.md markdown -----\s*(.*?)\s*----- end -----",
@@ -216,6 +220,80 @@ def build_retriever_data_models(
     return models
 
 
+def build_summary_retriever_data_models(
+    done_dir: Path,
+    batch_results_dir: Path,
+    *,
+    require_batch_output: bool = True,
+    skill_md_records_path: Path | None = None,
+    load_skill_md_records: bool = True,
+) -> list[SummaryRetrieverDataModel]:
+    """Build summary retriever rows by joining done rows and summary batch outputs."""
+    done_paths = _iter_jsonl_files(done_dir)
+    output_paths = _iter_jsonl_files_recursive(batch_results_dir)
+
+    done_rows = _read_jsonl_rows(done_paths)
+    output_rows = _read_jsonl_rows(output_paths)
+
+    done_by_id = index_rows_by_custom_id(done_rows)
+    output_by_id = index_rows_by_custom_id(output_rows)
+
+    records_path = (
+        skill_md_records_path
+        if skill_md_records_path is not None
+        else _DEFAULT_SKILL_MD_RECORDS
+    )
+    records_by_id: dict[str, dict[str, Any]] = {}
+    if load_skill_md_records:
+        records_by_id = _load_skill_md_records_by_custom_id(records_path)
+    else:
+        log.info("skill_md_records merge disabled (load_skill_md_records=False)")
+
+    models: list[SummaryRetrieverDataModel] = []
+    missing_output = 0
+    invalid_extraction = 0
+    missing_record = 0
+    for custom_id in sorted(done_by_id.keys()):
+        done_row = done_by_id[custom_id]
+        output_row = output_by_id.get(custom_id)
+        if require_batch_output and output_row is None:
+            missing_output += 1
+            continue
+
+        markdown_content = extract_skill_markdown_from_done_row(done_row)
+        extraction: SkillMdSummaryExtraction | None = None
+        if output_row is not None:
+            extraction = summary_extraction_from_batch_output_row(output_row)
+        if extraction is None:
+            if require_batch_output or output_row is not None:
+                invalid_extraction += 1
+            continue
+
+        record_row = records_by_id.get(custom_id)
+        if load_skill_md_records and record_row is None:
+            missing_record += 1
+        metadata = (
+            _skill_md_record_metadata_only(record_row) if load_skill_md_records else {}
+        )
+
+        models.append(
+            SummaryRetrieverDataModel(
+                custom_id=custom_id,
+                markdown_content=markdown_content,
+                seed_questions=extraction.seed_questions,
+                summary=extraction.summary,
+                name=metadata.get("name", ""),
+                description=metadata.get("description", ""),
+                metadata=metadata,
+            )
+        )
+
+    log.info(
+        f"{len(models)=}, {missing_output=}, {invalid_extraction=}, {missing_record=}"
+    )
+    return models
+
+
 def _redo_input_rows_for_done_and_outputs(
     done_by_id: dict[str, dict[str, Any]],
     output_by_id: dict[str, dict[str, Any]],
@@ -313,6 +391,25 @@ def retriever_models_to_jsonl(models: list[RetrieverDataModel], path: Path) -> N
                 "what": item.what,
                 "why": item.why,
                 "seed_questions": item.seed_questions,
+                "metadata": item.metadata,
+            }
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    log.info(f"wrote {len(models)} rows to {path=}")
+
+
+def summary_retriever_models_to_jsonl(
+    models: list[SummaryRetrieverDataModel],
+    path: Path,
+) -> None:
+    """Write ``SummaryRetrieverDataModel`` instances as JSONL."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for item in models:
+            payload = {
+                "custom_id": item.custom_id,
+                "markdown_content": item.markdown_content,
+                "seed_questions": item.seed_questions,
+                "summary": item.summary,
                 "metadata": item.metadata,
             }
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")

@@ -45,6 +45,11 @@ FIELD_CONFIGS: tuple[_FieldBuildConfig, ...] = (
         collection_name="retriever_why",
     ),
     _FieldBuildConfig(
+        field_name="summary",
+        db_dir_name="summary_db",
+        collection_name="retriever_summary",
+    ),
+    _FieldBuildConfig(
         field_name="description",
         db_dir_name="description_db",
         collection_name="retriever_description",
@@ -74,16 +79,21 @@ def _rows_to_models(rows: list[dict[str, Any]]) -> list[RetrieverDataModel]:
     """Converts dictionary rows into ``RetrieverDataModel`` objects."""
     models: list[RetrieverDataModel] = []
     for row in rows:
+        seed_questions = row.get("seed_questions", [])
+        if not isinstance(seed_questions, list):
+            seed_questions = []
+
         model = RetrieverDataModel(
             custom_id=str(row.get("custom_id", "")),
             markdown_content=str(row.get("markdown_content", "")),
             reasoning=str(row.get("reasoning", "")),
             what=str(row.get("what", "")),
             why=str(row.get("why", "")),
-            seed_questions=str(row.get("seed_questions", "")),
+            seed_questions=[str(question) for question in seed_questions],
             name=str(row.get("name", "")),
             description=str(row.get("description", "")),
             metadata=dict(row.get("metadata", {})),
+            summary=str(row.get("summary", "")),
         )
         models.append(model)
     log.info(f"{len(models)=}")
@@ -231,7 +241,7 @@ def build_chroma_databases(
     api_key: str = "EMPTY",
     embedding_batch_size: int = 4096,
 ) -> None:
-    """Builds three ChromaDB databases for what/why/description fields."""
+    """Builds ChromaDB databases for what/why/summary/description fields."""
     input_jsonl = Path(input_jsonl_path)
     output_root = Path(output_root_dir)
     log.info(

@@ -11,6 +11,32 @@ from loguru import logger as log
 from rank_bm25 import BM25Okapi
 
 _TOKEN_PATTERN = re.compile(r"\w+")
+_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "this",
+    "to",
+    "was",
+    "were",
+    "will",
+    "with",
+}
 
 
 class _Bm25PersistedIndex(NamedTuple):
@@ -20,6 +46,7 @@ class _Bm25PersistedIndex(NamedTuple):
     documents: list[str]
     tokenized_documents: list[list[str]]
     metadatas: list[dict[str, Any]]
+    remove_stopwords: bool
 
 
 class _Bm25QueryResult(NamedTuple):
@@ -29,9 +56,12 @@ class _Bm25QueryResult(NamedTuple):
     scores: list[float]
 
 
-def tokenize(text: str) -> list[str]:
+def tokenize(text: str, remove_stopwords: bool = True) -> list[str]:
     """Tokenizes text into lowercase alphanumeric terms."""
-    return [token.lower() for token in _TOKEN_PATTERN.findall(text)]
+    terms = [token.lower() for token in _TOKEN_PATTERN.findall(text)]
+    if not remove_stopwords:
+        return terms
+    return [term for term in terms if term not in _STOPWORDS]
 
 
 def write_bm25_index(
@@ -40,14 +70,18 @@ def write_bm25_index(
     documents: list[str],
     metadatas: list[dict[str, Any]],
     output_path: Path,
+    remove_stopwords: bool = True,
 ) -> None:
     """Writes BM25-ready payload as JSON."""
-    tokenized_documents = [tokenize(document) for document in documents]
+    tokenized_documents = [
+        tokenize(document, remove_stopwords=remove_stopwords) for document in documents
+    ]
     payload = {
         "ids": ids,
         "documents": documents,
         "tokenized_documents": tokenized_documents,
         "metadatas": metadatas,
+        "remove_stopwords": remove_stopwords,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -62,6 +96,7 @@ def load_bm25_index(path: Path) -> _Bm25PersistedIndex:
         documents=list(payload.get("documents", [])),
         tokenized_documents=list(payload.get("tokenized_documents", [])),
         metadatas=list(payload.get("metadatas", [])),
+        remove_stopwords=bool(payload.get("remove_stopwords", True)),
     )
     log.info(f"{path=}, {len(index.ids)=}")
     return index
@@ -72,7 +107,7 @@ def bm25_search(index: _Bm25PersistedIndex, query: str, limit: int) -> _Bm25Quer
     if not index.ids:
         return _Bm25QueryResult(ids=[], scores=[])
 
-    tokenized_query = tokenize(query)
+    tokenized_query = tokenize(query, remove_stopwords=index.remove_stopwords)
     bm25 = BM25Okapi(index.tokenized_documents)
     raw_scores = bm25.get_scores(tokenized_query)
 

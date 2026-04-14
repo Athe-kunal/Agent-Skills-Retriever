@@ -39,7 +39,10 @@ class _SearchArtifacts(NamedTuple):
 FIELD_CONFIGS: dict[str, _FieldSearchConfig] = {
     "what": _FieldSearchConfig("what", "what_db", "retriever_what"),
     "why": _FieldSearchConfig("why", "why_db", "retriever_why"),
-    "description": _FieldSearchConfig("description", "description_db", "retriever_description"),
+    "summary": _FieldSearchConfig("summary", "summary_db", "retriever_summary"),
+    "description": _FieldSearchConfig(
+        "description", "description_db", "retriever_description"
+    ),
 }
 
 

@@ -8,7 +8,7 @@ from typing import Any, NamedTuple
 from loguru import logger as log
 from pydantic import ValidationError
 
-from ast_skills.data_gen.synthetic_data_gen import SkillMdExtraction
+from ast_skills.data_gen.datamodels import SkillMdExtraction, SkillMdSummaryExtraction
 
 
 def _coerce_skill_md_metadata(raw: object) -> dict[str, str]:
@@ -113,6 +113,30 @@ def usage_from_batch_output_row(row: dict[str, Any]) -> BatchTokenUsage | None:
 
 def extraction_from_batch_output_row(row: dict[str, Any]) -> SkillMdExtraction | None:
     """Parse and validate the assistant message as ``SkillMdExtraction``."""
+    parsed_payload = _parsed_batch_output_content(row)
+    if parsed_payload is None:
+        return None
+    try:
+        return SkillMdExtraction.model_validate(parsed_payload)
+    except ValidationError:
+        return None
+
+
+def summary_extraction_from_batch_output_row(
+    row: dict[str, Any],
+) -> SkillMdSummaryExtraction | None:
+    """Parse and validate the assistant message as ``SkillMdSummaryExtraction``."""
+    parsed_payload = _parsed_batch_output_content(row)
+    if parsed_payload is None:
+        return None
+    try:
+        return SkillMdSummaryExtraction.model_validate(parsed_payload)
+    except ValidationError:
+        return None
+
+
+def _parsed_batch_output_content(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract parsed JSON content from a successful batch output row."""
     if row.get("error") is not None:
         return None
     response = row.get("response")
@@ -136,10 +160,7 @@ def extraction_from_batch_output_row(row: dict[str, Any]) -> SkillMdExtraction |
         return None
     if not isinstance(parsed, dict):
         return None
-    try:
-        return SkillMdExtraction.model_validate(parsed)
-    except ValidationError:
-        return None
+    return parsed
 
 
 def messages_from_batch_input_row(row: dict[str, Any]) -> list[dict[str, Any]]:

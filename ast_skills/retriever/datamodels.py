@@ -18,3 +18,17 @@ class RetrieverDataModel:
     name: str
     description: str
     metadata: dict[str, str]
+    summary: str = ""
+
+
+@dataclass(frozen=True)
+class SummaryRetrieverDataModel:
+    """One retriever training row for summary-based retrieval."""
+
+    custom_id: str
+    markdown_content: str
+    seed_questions: list[str]
+    summary: str
+    name: str
+    description: str
+    metadata: dict[str, str]
