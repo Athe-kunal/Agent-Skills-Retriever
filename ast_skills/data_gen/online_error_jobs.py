@@ -10,7 +10,7 @@ from typing import Any, NamedTuple
 import fire
 from loguru import logger
 
-from batch_jobs import (
+from .batch_jobs import (
     ONLINE_OUTPUT_DIR,
     _OnlineOutcome,
     build_async_client,
