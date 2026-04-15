@@ -12,17 +12,21 @@ for instruction-tuned embedding models.
 from __future__ import annotations
 
 import json
+import asyncio
 from pathlib import Path
 from typing import NamedTuple, Sequence
 
 import fire
 import numpy as np
+import pandas as pd
 import wandb
 import yaml
 from loguru import logger as log
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
+from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 
+from ast_skills.data_gen.datamodels import TrainingData
 from ast_skills.retriever.datamodels import SummaryRetrieverDataModel
 
 
@@ -50,11 +54,40 @@ class _QueryPayload(NamedTuple):
     expected_names: list[str]
 
 
+class _ValidationPayload(NamedTuple):
+    """Loaded validation rows plus query labels."""
+
+    rows: list[TrainingData]
+    query_texts: list[str]
+    expected_names: list[str]
+
+
 class _EncodedCorpus(NamedTuple):
     """Encoded document representation for retrieval."""
 
     sentence_embeddings: np.ndarray | None
     token_embeddings: list[np.ndarray] | None
+
+
+class _ValidationModelConfig(NamedTuple):
+    """Model configuration for validation parquet evaluation."""
+
+    model_key: str
+    model_type: str
+    model_name: str
+
+
+class _ValidationFieldConfig(NamedTuple):
+    """Field configuration for validation parquet evaluation."""
+
+    field_key: str
+
+
+class _TextChunk(NamedTuple):
+    """Chunk of texts and its start index in the original sequence."""
+
+    start_index: int
+    texts: list[str]
 
 
 class _EncodedQueries(NamedTuple):
@@ -104,6 +137,80 @@ def _load_rows(dataset_jsonl: str) -> list[SummaryRetrieverDataModel]:
     return rows
 
 
+VALIDATION_MODEL_CONFIGS: tuple[_ValidationModelConfig, ...] = (
+    _ValidationModelConfig(
+        model_key="bert_large_encoder",
+        model_type="dense",
+        model_name="sentence-transformers/bert-large-nli-mean-tokens",
+    ),
+    _ValidationModelConfig(
+        model_key="qwen3_0_6b",
+        model_type="dense",
+        model_name="Qwen/Qwen3-Embedding-0.6B",
+    ),
+    _ValidationModelConfig(
+        model_key="bm25",
+        model_type="sparse",
+        model_name="bm25",
+    ),
+)
+
+VALIDATION_FIELD_CONFIGS: tuple[_ValidationFieldConfig, ...] = (
+    _ValidationFieldConfig(field_key="summary"),
+    _ValidationFieldConfig(field_key="description"),
+)
+
+
+def _load_validation_payload(validation_parquet: str) -> _ValidationPayload:
+    """Loads ``TrainingData`` rows from validation parquet."""
+    validation_path = Path(validation_parquet)
+    dataframe = pd.read_parquet(validation_path)
+    rows: list[TrainingData] = []
+    for record in dataframe.to_dict(orient="records"):
+        rows.append(TrainingData(**record))
+
+    query_texts = [row.question.strip() for row in rows if row.question.strip()]
+    expected_names = [row.name.strip() for row in rows if row.question.strip()]
+    payload = _ValidationPayload(
+        rows=rows,
+        query_texts=query_texts,
+        expected_names=expected_names,
+    )
+    log.info(f"{validation_path=}, {len(rows)=}, {len(query_texts)=}")
+    return payload
+
+
+def _text_for_field(row: TrainingData, field_key: str) -> str:
+    """Returns text for ``summary`` or ``description`` field retrieval."""
+    if field_key == "summary":
+        return row.summary.strip()
+    if field_key == "description":
+        return row.description.strip()
+    raise ValueError(f"Unsupported field: {field_key}")
+
+
+def _build_validation_corpus(
+    rows: Sequence[TrainingData],
+    field_key: str,
+) -> _CorpusPayload:
+    """Builds unique corpus for one retrieval field."""
+    text_by_name: dict[str, str] = {}
+    for row in rows:
+        name = row.name.strip()
+        if not name or name in text_by_name:
+            continue
+        text = _text_for_field(row=row, field_key=field_key)
+        if not text:
+            continue
+        text_by_name[name] = text
+
+    names = list(text_by_name.keys())
+    texts = [text_by_name[name] for name in names]
+    payload = _CorpusPayload(texts=texts, names=names)
+    log.info(f"{field_key=}, {len(names)=}, {len(texts)=}")
+    return payload
+
+
 def _apply_instruction(text: str, instruction: str) -> str:
     """Prepends instruction text when provided."""
     normalized_text = text.strip()
@@ -148,19 +255,34 @@ def _build_queries(
     return payload
 
 
-def _encode_sentence_embeddings(model: SentenceTransformer, texts: Sequence[str]) -> np.ndarray:
+def _encode_sentence_embeddings(
+    model: SentenceTransformer,
+    texts: Sequence[str],
+    batch_size: int,
+) -> np.ndarray:
     """Encodes sentence-level embeddings with normalization."""
-    embeddings = model.encode(list(texts), normalize_embeddings=True, show_progress_bar=False)
+    embeddings = model.encode(
+        list(texts),
+        normalize_embeddings=True,
+        show_progress_bar=False,
+        batch_size=batch_size,
+    )
+    log.info(f"{batch_size=}, {len(texts)=}")
     return np.asarray(embeddings)
 
 
-def _encode_token_embeddings(model: SentenceTransformer, texts: Sequence[str]) -> list[np.ndarray]:
+def _encode_token_embeddings(
+    model: SentenceTransformer,
+    texts: Sequence[str],
+    batch_size: int,
+) -> list[np.ndarray]:
     """Encodes token-level embeddings for late interaction."""
     token_embeddings = model.encode(
         list(texts),
         output_value="token_embeddings",
         convert_to_numpy=True,
         show_progress_bar=False,
+        batch_size=batch_size,
     )
     normalized: list[np.ndarray] = []
     for token_matrix in token_embeddings:
@@ -170,25 +292,90 @@ def _encode_token_embeddings(model: SentenceTransformer, texts: Sequence[str]) -
     return normalized
 
 
-def _encode_vllm(
-    client: OpenAI,
+def _chunk_texts(texts: Sequence[str], batch_size: int) -> list[_TextChunk]:
+    """Splits input texts into fixed-size chunks."""
+    chunks: list[_TextChunk] = []
+    start_index = 0
+    while start_index < len(texts):
+        end_index = min(start_index + batch_size, len(texts))
+        chunks.append(_TextChunk(start_index=start_index, texts=list(texts[start_index:end_index])))
+        start_index = end_index
+    log.info(f"{len(texts)=}, {batch_size=}, {len(chunks)=}")
+    return chunks
+
+
+async def _fetch_embeddings_chunk(
+    client: AsyncOpenAI,
+    embedding_model: str,
+    text_chunk: _TextChunk,
+    semaphore: asyncio.Semaphore,
+) -> tuple[int, list[list[float]]]:
+    """Requests one embeddings chunk under semaphore control."""
+    async with semaphore:
+        response = await client.embeddings.create(model=embedding_model, input=text_chunk.texts)
+    embeddings = [item.embedding for item in response.data]
+    return text_chunk.start_index, embeddings
+
+
+async def _encode_vllm_async(
+    client: AsyncOpenAI,
     embedding_model: str,
     texts: Sequence[str],
     batch_size: int,
+    max_concurrency: int,
 ) -> np.ndarray:
-    """Encodes sentence embeddings with an OpenAI-compatible embeddings API."""
+    """Encodes embeddings with async OpenAI-compatible API and concurrency limits."""
+    chunks = _chunk_texts(texts=texts, batch_size=batch_size)
+    semaphore = asyncio.Semaphore(max_concurrency)
+    tasks = [
+        _fetch_embeddings_chunk(
+            client=client,
+            embedding_model=embedding_model,
+            text_chunk=text_chunk,
+            semaphore=semaphore,
+        )
+        for text_chunk in chunks
+    ]
+    chunk_results = await asyncio.gather(*tasks)
+    ordered_results = sorted(chunk_results, key=lambda item: item[0])
     vectors: list[list[float]] = []
-    start = 0
-    while start < len(texts):
-        end = min(start + batch_size, len(texts))
-        chunk = list(texts[start:end])
-        response = client.embeddings.create(model=embedding_model, input=chunk)
-        vectors.extend([item.embedding for item in response.data])
-        start = end
-    embeddings = np.asarray(vectors)
+    for _, chunk_vectors in ordered_results:
+        vectors.extend(chunk_vectors)
+    embeddings = np.asarray(vectors, dtype=np.float32)
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
+    log.info(f"{embeddings.shape=}, {max_concurrency=}")
     return embeddings / norms
+
+
+async def _encode_vllm_pair_async(
+    client: AsyncOpenAI,
+    model_name: str,
+    query_texts: Sequence[str],
+    doc_texts: Sequence[str],
+    batch_size: int,
+    max_concurrency: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Encodes query and document texts concurrently with async vLLM calls."""
+    encoded_queries_task = _encode_vllm_async(
+        client=client,
+        embedding_model=model_name,
+        texts=query_texts,
+        batch_size=batch_size,
+        max_concurrency=max_concurrency,
+    )
+    encoded_docs_task = _encode_vllm_async(
+        client=client,
+        embedding_model=model_name,
+        texts=doc_texts,
+        batch_size=batch_size,
+        max_concurrency=max_concurrency,
+    )
+    query_embeddings, doc_embeddings = await asyncio.gather(
+        encoded_queries_task,
+        encoded_docs_task,
+    )
+    return query_embeddings, doc_embeddings
 
 
 def _late_interaction_score(query_tokens: np.ndarray, doc_tokens: np.ndarray) -> float:
@@ -221,6 +408,27 @@ def _score_late_interaction(
                 query_tokens=query_tokens,
                 doc_tokens=doc_tokens,
             )
+    return score_matrix
+
+
+def _tokenize_for_bm25(text: str) -> list[str]:
+    """Tokenizes text for BM25."""
+    return text.casefold().split()
+
+
+def _score_bm25(
+    query_texts: Sequence[str],
+    doc_texts: Sequence[str],
+) -> np.ndarray:
+    """Returns BM25 score matrix for all query-document pairs."""
+    tokenized_docs = [_tokenize_for_bm25(text) for text in doc_texts]
+    bm25 = BM25Okapi(tokenized_docs)
+    score_rows: list[np.ndarray] = []
+    for query_text in query_texts:
+        tokenized_query = _tokenize_for_bm25(query_text)
+        score_rows.append(np.asarray(bm25.get_scores(tokenized_query), dtype=np.float32))
+    score_matrix = np.vstack(score_rows)
+    log.info(f"{score_matrix.shape=}")
     return score_matrix
 
 
@@ -284,10 +492,19 @@ def _encode_sentence_backend(
     model: SentenceTransformer,
     query_texts: Sequence[str],
     doc_texts: Sequence[str],
+    sentence_batch_size: int,
 ) -> tuple[_EncodedQueries, _EncodedCorpus]:
     """Encodes sentence-level vectors for bi-encoder retrieval."""
-    query_embeddings = _encode_sentence_embeddings(model=model, texts=query_texts)
-    doc_embeddings = _encode_sentence_embeddings(model=model, texts=doc_texts)
+    query_embeddings = _encode_sentence_embeddings(
+        model=model,
+        texts=query_texts,
+        batch_size=sentence_batch_size,
+    )
+    doc_embeddings = _encode_sentence_embeddings(
+        model=model,
+        texts=doc_texts,
+        batch_size=sentence_batch_size,
+    )
     encoded_queries = _EncodedQueries(
         sentence_embeddings=query_embeddings,
         token_embeddings=None,
@@ -303,10 +520,19 @@ def _encode_late_interaction_backend(
     model: SentenceTransformer,
     query_texts: Sequence[str],
     doc_texts: Sequence[str],
+    sentence_batch_size: int,
 ) -> tuple[_EncodedQueries, _EncodedCorpus]:
     """Encodes token-level vectors for late-interaction retrieval."""
-    query_tokens = _encode_token_embeddings(model=model, texts=query_texts)
-    doc_tokens = _encode_token_embeddings(model=model, texts=doc_texts)
+    query_tokens = _encode_token_embeddings(
+        model=model,
+        texts=query_texts,
+        batch_size=sentence_batch_size,
+    )
+    doc_tokens = _encode_token_embeddings(
+        model=model,
+        texts=doc_texts,
+        batch_size=sentence_batch_size,
+    )
     encoded_queries = _EncodedQueries(
         sentence_embeddings=None,
         token_embeddings=query_tokens,
@@ -319,24 +545,23 @@ def _encode_late_interaction_backend(
 
 
 def _encode_vllm_backend(
-    client: OpenAI,
+    client: AsyncOpenAI,
     model_name: str,
     query_texts: Sequence[str],
     doc_texts: Sequence[str],
     batch_size: int,
+    max_concurrency: int,
 ) -> tuple[_EncodedQueries, _EncodedCorpus]:
     """Encodes sentence-level vectors via vLLM embeddings endpoint."""
-    query_embeddings = _encode_vllm(
-        client=client,
-        embedding_model=model_name,
-        texts=query_texts,
-        batch_size=batch_size,
-    )
-    doc_embeddings = _encode_vllm(
-        client=client,
-        embedding_model=model_name,
-        texts=doc_texts,
-        batch_size=batch_size,
+    query_embeddings, doc_embeddings = asyncio.run(
+        _encode_vllm_pair_async(
+            client=client,
+            model_name=model_name,
+            query_texts=query_texts,
+            doc_texts=doc_texts,
+            batch_size=batch_size,
+            max_concurrency=max_concurrency,
+        )
     )
     encoded_queries = _EncodedQueries(
         sentence_embeddings=query_embeddings,
@@ -390,6 +615,8 @@ def evaluate(
     vllm_base_url: str = "http://127.0.0.1:8000/v1",
     vllm_api_key: str = "EMPTY",
     vllm_batch_size: int = 64,
+    vllm_max_concurrency: int = 8,
+    sentence_batch_size: int = 64,
 ) -> dict[str, float]:
     """Evaluates retrieval and logs metrics to W&B.
 
@@ -405,6 +632,8 @@ def evaluate(
       vllm_base_url: OpenAI-compatible vLLM endpoint.
       vllm_api_key: API key for vLLM endpoint.
       vllm_batch_size: Batch size for vLLM embedding requests.
+      vllm_max_concurrency: Max concurrent requests for async vLLM embedding calls.
+      sentence_batch_size: Batch size for SentenceTransformer encoding.
 
     Returns:
       Dict of scalar metrics.
@@ -420,6 +649,9 @@ def evaluate(
         "query_instruction": query_instruction,
         "document_instruction": document_instruction,
         "vllm_base_url": vllm_base_url,
+        "vllm_batch_size": vllm_batch_size,
+        "vllm_max_concurrency": vllm_max_concurrency,
+        "sentence_batch_size": sentence_batch_size,
     }
     log.info(f"{wandb_config=}")
 
@@ -436,6 +668,7 @@ def evaluate(
             model=model,
             query_texts=queries.texts,
             doc_texts=corpus.texts,
+            sentence_batch_size=sentence_batch_size,
         )
     elif retrieval_backend == "late_interaction":
         model = SentenceTransformer(retrieval_model)
@@ -443,15 +676,17 @@ def evaluate(
             model=model,
             query_texts=queries.texts,
             doc_texts=corpus.texts,
+            sentence_batch_size=sentence_batch_size,
         )
     elif retrieval_backend == "vllm":
-        client = OpenAI(base_url=vllm_base_url, api_key=vllm_api_key)
+        client = AsyncOpenAI(base_url=vllm_base_url, api_key=vllm_api_key)
         encoded_queries, encoded_corpus = _encode_vllm_backend(
             client=client,
             model_name=retrieval_model,
             query_texts=queries.texts,
             doc_texts=corpus.texts,
             batch_size=vllm_batch_size,
+            max_concurrency=vllm_max_concurrency,
         )
     else:
         raise ValueError(
@@ -493,9 +728,151 @@ def evaluate_from_config(config_path: str = "configs/train.yaml") -> dict[str, f
     return evaluate(**evaluate_kwargs)
 
 
+def _build_validation_wandb_config(
+    validation_parquet: str,
+    run_name: str,
+    sentence_batch_size: int,
+) -> dict[str, object]:
+    """Builds W&B config for validation parquet evaluation."""
+    config = {
+        "validation_parquet": validation_parquet,
+        "run_name": run_name,
+        "sentence_batch_size": sentence_batch_size,
+        "fields": [field.field_key for field in VALIDATION_FIELD_CONFIGS],
+        "models": [model.model_name for model in VALIDATION_MODEL_CONFIGS],
+    }
+    log.info(f"{config=}")
+    return config
+
+
+def _build_validation_payload(
+    metrics_by_field: dict[str, dict[str, RetrievalMetrics]],
+) -> dict[str, float]:
+    """Builds flattened payload for validation evaluation metrics."""
+    payload: dict[str, float] = {}
+    for field_key, metrics_by_model in metrics_by_field.items():
+        for model_key, metrics in metrics_by_model.items():
+            payload[f"eval/{field_key}/{model_key}/queries"] = float(metrics.total_queries)
+            payload[f"eval/{field_key}/{model_key}/hit_at_1"] = metrics.hit_at_1
+            payload[f"eval/{field_key}/{model_key}/hit_at_3"] = metrics.hit_at_3
+            payload[f"eval/{field_key}/{model_key}/hit_at_5"] = metrics.hit_at_5
+            payload[f"eval/{field_key}/{model_key}/mrr"] = metrics.mrr
+    log.info(f"{payload=}")
+    return payload
+
+
+def _build_validation_output(
+    metrics_by_field: dict[str, dict[str, RetrievalMetrics]],
+) -> dict[str, dict[str, dict[str, float]]]:
+    """Builds nested JSON-serializable metrics output."""
+    output: dict[str, dict[str, dict[str, float]]] = {}
+    for field_key, metrics_by_model in metrics_by_field.items():
+        output[field_key] = {}
+        for model_key, metrics in metrics_by_model.items():
+            output[field_key][model_key] = metrics._asdict()
+    log.info(f"{output=}")
+    return output
+
+
+def evaluate_validation_parquet(
+    validation_parquet: str = "Validation.parquet",
+    wandb_project: str = "ast-skills-retriever",
+    wandb_entity: str = "",
+    run_name: str = "validation-parquet-eval",
+    sentence_batch_size: int = 64,
+) -> dict[str, dict[str, dict[str, float]]]:
+    """Evaluates summary/description retrieval on validation parquet.
+
+    Runs BERT large encoder, Qwen3-0.6B, and BM25 across both retrieval fields.
+    """
+    validation_payload = _load_validation_payload(validation_parquet=validation_parquet)
+    metrics_by_field: dict[str, dict[str, RetrievalMetrics]] = {}
+
+    wandb.init(
+        project=wandb_project,
+        entity=wandb_entity or None,
+        name=run_name,
+        config=_build_validation_wandb_config(
+            validation_parquet=validation_parquet,
+            run_name=run_name,
+            sentence_batch_size=sentence_batch_size,
+        ),
+    )
+
+    for field_config in VALIDATION_FIELD_CONFIGS:
+        field_key = field_config.field_key
+        corpus = _build_validation_corpus(
+            rows=validation_payload.rows,
+            field_key=field_key,
+        )
+        metrics_by_model: dict[str, RetrievalMetrics] = {}
+        for model_config in VALIDATION_MODEL_CONFIGS:
+            log.info(f"{field_key=}, {model_config.model_key=}")
+            if model_config.model_type == "dense":
+                model = SentenceTransformer(model_config.model_name)
+                query_embeddings = _encode_sentence_embeddings(
+                    model=model,
+                    texts=validation_payload.query_texts,
+                    batch_size=sentence_batch_size,
+                )
+                doc_embeddings = _encode_sentence_embeddings(
+                    model=model,
+                    texts=corpus.texts,
+                    batch_size=sentence_batch_size,
+                )
+                score_matrix = _score_bi_encoder(
+                    query_embeddings=query_embeddings,
+                    doc_embeddings=doc_embeddings,
+                )
+            elif model_config.model_type == "sparse":
+                score_matrix = _score_bm25(
+                    query_texts=validation_payload.query_texts,
+                    doc_texts=corpus.texts,
+                )
+            else:
+                raise ValueError(f"Unsupported model type: {model_config.model_type}")
+
+            metrics = _compute_metrics(
+                score_matrix=score_matrix,
+                expected_names=validation_payload.expected_names,
+                corpus_names=corpus.names,
+            )
+            metrics_by_model[model_config.model_key] = metrics
+        metrics_by_field[field_key] = metrics_by_model
+
+    wandb.log(_build_validation_payload(metrics_by_field))
+    table_rows = []
+    for field_key, metrics_by_model in metrics_by_field.items():
+        for model_key, metrics in metrics_by_model.items():
+            table_rows.append(
+                [
+                    field_key,
+                    model_key,
+                    metrics.total_queries,
+                    metrics.hit_at_1,
+                    metrics.hit_at_3,
+                    metrics.hit_at_5,
+                    metrics.mrr,
+                ]
+            )
+    table = wandb.Table(
+        columns=["field", "model", "queries", "hit_at_1", "hit_at_3", "hit_at_5", "mrr"],
+        data=table_rows,
+    )
+    wandb.log({"eval/model_comparison": table})
+    wandb.finish()
+    return _build_validation_output(metrics_by_field)
+
+
 def main() -> None:
     """CLI entrypoint."""
-    fire.Fire({"evaluate": evaluate, "evaluate_from_config": evaluate_from_config})
+    fire.Fire(
+        {
+            "evaluate": evaluate,
+            "evaluate_from_config": evaluate_from_config,
+            "evaluate_validation_parquet": evaluate_validation_parquet,
+        }
+    )
 
 
 if __name__ == "__main__":
