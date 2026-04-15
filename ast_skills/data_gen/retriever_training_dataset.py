@@ -140,12 +140,15 @@ def _rows_to_summary_models(
     """Converts dictionaries to ``SummaryRetrieverDataModel`` objects."""
     models: list[SummaryRetrieverDataModel] = []
     for row in rows:
+        normalized_seed_questions = [
+            _normalize_corpus_field_text(str(question))
+            for question in row.get("seed_questions", [])
+        ]
         model = SummaryRetrieverDataModel(
             custom_id=str(row.get("custom_id", "")),
             markdown_content=str(row.get("markdown_content", "")),
             seed_questions=[
-                _normalize_corpus_field_text(str(question))
-                for question in row.get("seed_questions", [])
+                question for question in normalized_seed_questions if question.strip()
             ],
             summary=_normalize_corpus_field_text(str(row.get("summary", ""))),
             name=str(row.get("name", "")),
@@ -185,10 +188,30 @@ def _split_rows(
 
 def _pick_question(seed_questions: list[str], rng: random.Random) -> str:
     """Picks one random non-empty seed question."""
-    candidates = [question.strip() for question in seed_questions if question.strip()]
+    candidates = [
+        question.strip() for question in seed_questions if question and question.strip()
+    ]
     if not candidates:
         return ""
     return rng.choice(candidates)
+
+
+def _pick_row_query(row: SummaryRetrieverDataModel, rng: random.Random) -> str:
+    """Picks a non-empty query from seed questions, else from name/summary/description."""
+    question = _pick_question(row.seed_questions, rng)
+    if question:
+        return question
+    fallbacks = [
+        text.strip()
+        for text in (row.name, row.summary, row.description)
+        if text and text.strip()
+    ]
+    if not fallbacks:
+        log.warning(
+            f"No non-empty seed questions or fallback text for {row.custom_id=}"
+        )
+        return ""
+    return rng.choice(fallbacks)
 
 
 def _build_negative_lookup(
@@ -304,8 +327,10 @@ def _build_row_questions(
     question_rng = random.Random(question_pick_seed)
     row_questions: list[_RowQuestion] = []
     for row_index, row in enumerate(rows):
-        question = _pick_question(row.seed_questions, question_rng)
-        row_questions.append(_RowQuestion(row_index=row_index, row=row, question=question))
+        question = _pick_row_query(row, question_rng)
+        row_questions.append(
+            _RowQuestion(row_index=row_index, row=row, question=question)
+        )
     log.info(f"{len(row_questions)=}")
     return row_questions
 
@@ -401,7 +426,9 @@ async def _build_training_dataset_async(
         raise ValueError("max_concurrency must be >= 1.")
 
     lookup = _build_negative_lookup(all_rows)
-    row_questions = _build_row_questions(rows=rows, question_pick_seed=question_pick_seed)
+    row_questions = _build_row_questions(
+        rows=rows, question_pick_seed=question_pick_seed
+    )
     semaphore = asyncio.Semaphore(max_concurrency)
 
     tasks: list[asyncio.Task[TrainingData | None]] = []
@@ -463,7 +490,7 @@ def build_training_and_validation_datasets(
     window_start_rank: int = 5,
     window_end_rank: int = 36,
     negatives_per_row: int = 32,
-    max_concurrency: int = 128,
+    max_concurrency: int = 64,
     smoke_test: bool = False,
 ) -> None:
     """Builds train/validation datasets with hybrid-mined hard negatives.
