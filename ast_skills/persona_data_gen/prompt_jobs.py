@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import NamedTuple
 
@@ -126,11 +127,69 @@ def _parse_persona_jsonl_line(raw_row: dict) -> _PersonaJsonlRow:
             elif isinstance(raw_persona, str):
                 personas.append(_persona_from_string(raw_persona))
 
+    if not personas:
+        personas_text = _extract_personas_text(raw_row)
+        personas = _parse_persona_list_text(personas_text)
+
     return _PersonaJsonlRow(
         relative_path=relative_path,
         skill_name=skill_name,
         personas=personas,
     )
+
+
+def _extract_personas_text(raw_row: dict) -> str:
+    """Extract persona text from common output keys in a JSONL row."""
+    text_keys = ["personas_text", "response_text", "model_output", "personas"]
+    for key in text_keys:
+        value = raw_row.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def _clean_persona_line(line: str) -> str:
+    """Normalize one raw persona line by removing numbering and markdown bullets."""
+    cleaned = line.strip()
+    cleaned = cleaned.lstrip("-*").strip()
+
+    if ". " in cleaned:
+        prefix, suffix = cleaned.split(". ", maxsplit=1)
+        if prefix.isdigit() and suffix:
+            return suffix.strip()
+    return cleaned
+
+
+def _parse_persona_list_text(personas_text: str) -> list[PersonaProfile]:
+    """Parse a numbered or bulleted persona list from natural-language text."""
+    blocks = _split_persona_text_blocks(personas_text)
+    personas: list[PersonaProfile] = []
+
+    for block in blocks:
+        cleaned = _clean_persona_line(block)
+        if not cleaned:
+            continue
+        personas.append(_persona_from_string(cleaned))
+
+    logger.info(f"{len(personas)=}")
+    return personas
+
+
+def _split_persona_text_blocks(personas_text: str) -> list[str]:
+    """Split model output into persona-sized text blocks."""
+    numbered_item_re = re.compile(r"(?:^|\n)\s*\d+\.\s+")
+    has_numbered_items = bool(numbered_item_re.search(personas_text))
+    if has_numbered_items:
+        parts = numbered_item_re.split(personas_text)
+        return [part.strip() for part in parts if part.strip()]
+
+    paragraph_parts = personas_text.split("\n\n")
+    paragraphs = [part.strip() for part in paragraph_parts if part.strip()]
+    if paragraphs:
+        return paragraphs
+
+    lines = [line.strip() for line in personas_text.splitlines() if line.strip()]
+    return lines
 
 
 def read_persona_generation_output_jsonl(input_path: str) -> list[_PersonaJsonlRow]:
