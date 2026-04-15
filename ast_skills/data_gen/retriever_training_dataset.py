@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import random
 from pathlib import Path
@@ -46,6 +47,14 @@ class _NegativeWindowConfig(NamedTuple):
     window_start_rank: int
     window_end_rank: int
     negatives_per_row: int
+
+
+class _RowQuestion(NamedTuple):
+    """Row with pre-selected question for async processing."""
+
+    row_index: int
+    row: SummaryRetrieverDataModel
+    question: str
 
 
 _TRAINING_ROW_FEATURES = Features(
@@ -287,6 +296,134 @@ def _mine_field_negatives(
     return sampled_negatives
 
 
+def _build_row_questions(
+    rows: list[SummaryRetrieverDataModel],
+    question_pick_seed: int,
+) -> list[_RowQuestion]:
+    """Pre-computes one question per row before asynchronous execution."""
+    question_rng = random.Random(question_pick_seed)
+    row_questions: list[_RowQuestion] = []
+    for row_index, row in enumerate(rows):
+        question = _pick_question(row.seed_questions, question_rng)
+        row_questions.append(_RowQuestion(row_index=row_index, row=row, question=question))
+    log.info(f"{len(row_questions)=}")
+    return row_questions
+
+
+async def _mine_field_negatives_async(
+    question: str,
+    positive_custom_id: str,
+    lookup_by_custom_id: dict[str, str],
+    field: str,
+    hybrid_config: _HybridSearchConfig,
+    window_config: _NegativeWindowConfig,
+    rng: random.Random,
+    semaphore: asyncio.Semaphore,
+) -> list[str]:
+    """Asynchronously mines negatives with concurrency control."""
+    async with semaphore:
+        return await asyncio.to_thread(
+            _mine_field_negatives,
+            question,
+            positive_custom_id,
+            lookup_by_custom_id,
+            field,
+            hybrid_config,
+            window_config,
+            rng,
+        )
+
+
+async def _build_training_row_async(
+    row_question: _RowQuestion,
+    lookup: _NegativeTextLookup,
+    hybrid_config: _HybridSearchConfig,
+    window_config: _NegativeWindowConfig,
+    seed: int,
+    semaphore: asyncio.Semaphore,
+) -> TrainingData | None:
+    """Builds a single ``TrainingData`` row asynchronously."""
+    row = row_question.row
+    question = row_question.question
+    if not question:
+        log.warning(f"Skipping row with empty question for {row.custom_id=}")
+        return None
+
+    rng_seed_base = seed + (row_question.row_index * 10_000)
+    summary_rng = random.Random(rng_seed_base + 1)
+    description_rng = random.Random(rng_seed_base + 2)
+
+    negative_summaries_task = _mine_field_negatives_async(
+        question=question,
+        positive_custom_id=row.custom_id,
+        lookup_by_custom_id=lookup.summary_by_custom_id,
+        field="summary",
+        hybrid_config=hybrid_config,
+        window_config=window_config,
+        rng=summary_rng,
+        semaphore=semaphore,
+    )
+    negative_descriptions_task = _mine_field_negatives_async(
+        question=question,
+        positive_custom_id=row.custom_id,
+        lookup_by_custom_id=lookup.description_by_custom_id,
+        field="description",
+        hybrid_config=hybrid_config,
+        window_config=window_config,
+        rng=description_rng,
+        semaphore=semaphore,
+    )
+    negative_summaries, negative_descriptions = await asyncio.gather(
+        negative_summaries_task, negative_descriptions_task
+    )
+
+    return TrainingData(
+        question=question,
+        name=row.name,
+        summary=row.summary,
+        description=row.description,
+        in_batch_negatives_descriptions=negative_descriptions,
+        in_batch_negatives_summary=negative_summaries,
+    )
+
+
+async def _build_training_dataset_async(
+    rows: list[SummaryRetrieverDataModel],
+    all_rows: list[SummaryRetrieverDataModel],
+    hybrid_config: _HybridSearchConfig,
+    window_config: _NegativeWindowConfig,
+    seed: int,
+    question_pick_seed: int,
+    max_concurrency: int,
+) -> list[TrainingData]:
+    """Builds ``TrainingData`` rows for one split using async concurrency."""
+    if max_concurrency < 1:
+        raise ValueError("max_concurrency must be >= 1.")
+
+    lookup = _build_negative_lookup(all_rows)
+    row_questions = _build_row_questions(rows=rows, question_pick_seed=question_pick_seed)
+    semaphore = asyncio.Semaphore(max_concurrency)
+
+    tasks: list[asyncio.Task[TrainingData | None]] = []
+    for row_question in row_questions:
+        task = asyncio.create_task(
+            _build_training_row_async(
+                row_question=row_question,
+                lookup=lookup,
+                hybrid_config=hybrid_config,
+                window_config=window_config,
+                seed=seed,
+                semaphore=semaphore,
+            )
+        )
+        tasks.append(task)
+
+    training_rows_or_none = await asyncio.gather(*tasks)
+    output_rows = [row for row in training_rows_or_none if row is not None]
+    log.info(f"{max_concurrency=}, {len(output_rows)=}")
+    return output_rows
+
+
 def _build_training_dataset(
     rows: list[SummaryRetrieverDataModel],
     all_rows: list[SummaryRetrieverDataModel],
@@ -294,51 +431,20 @@ def _build_training_dataset(
     window_config: _NegativeWindowConfig,
     seed: int,
     question_pick_seed: int,
+    max_concurrency: int,
 ) -> list[TrainingData]:
-    """Builds ``TrainingData`` rows for one split."""
-    lookup = _build_negative_lookup(all_rows)
-    question_rng = random.Random(question_pick_seed)
-    negatives_rng = random.Random(seed)
-
-    output_rows: list[TrainingData] = []
-    for row in rows:
-        question = _pick_question(row.seed_questions, question_rng)
-        if not question:
-            log.warning(f"Skipping row with empty question for {row.custom_id=}")
-            continue
-
-        negative_summaries = _mine_field_negatives(
-            question=question,
-            positive_custom_id=row.custom_id,
-            lookup_by_custom_id=lookup.summary_by_custom_id,
-            field="summary",
+    """Sync wrapper around async split dataset builder."""
+    return asyncio.run(
+        _build_training_dataset_async(
+            rows=rows,
+            all_rows=all_rows,
             hybrid_config=hybrid_config,
             window_config=window_config,
-            rng=negatives_rng,
+            seed=seed,
+            question_pick_seed=question_pick_seed,
+            max_concurrency=max_concurrency,
         )
-        negative_descriptions = _mine_field_negatives(
-            question=question,
-            positive_custom_id=row.custom_id,
-            lookup_by_custom_id=lookup.description_by_custom_id,
-            field="description",
-            hybrid_config=hybrid_config,
-            window_config=window_config,
-            rng=negatives_rng,
-        )
-
-        output_rows.append(
-            TrainingData(
-                question=question,
-                name=row.name,
-                summary=row.summary,
-                description=row.description,
-                in_batch_negatives_descriptions=negative_descriptions,
-                in_batch_negatives_summary=negative_summaries,
-            )
-        )
-
-    log.info(f"{len(output_rows)=}")
-    return output_rows
+    )
 
 
 def build_training_and_validation_datasets(
@@ -357,6 +463,7 @@ def build_training_and_validation_datasets(
     window_start_rank: int = 5,
     window_end_rank: int = 36,
     negatives_per_row: int = 32,
+    max_concurrency: int = 128,
     smoke_test: bool = False,
 ) -> None:
     """Builds train/validation datasets with hybrid-mined hard negatives.
@@ -377,6 +484,7 @@ def build_training_and_validation_datasets(
       window_start_rank: First rank (1-indexed) of hard-negative window.
       window_end_rank: Last rank (1-indexed, inclusive) of hard-negative window.
       negatives_per_row: Number of sampled negatives per field.
+      max_concurrency: Maximum number of concurrent row/field retrieval tasks.
       smoke_test: If True, only the first input row is processed for outputs; the
         full file is still used to resolve retrieved ids to summary/description text.
     """
@@ -414,6 +522,7 @@ def build_training_and_validation_datasets(
         window_config=window_config,
         seed=random_seed,
         question_pick_seed=question_pick_seed,
+        max_concurrency=max_concurrency,
     )
     validation_rows = _build_training_dataset(
         rows=split.validation_rows,
@@ -422,6 +531,7 @@ def build_training_and_validation_datasets(
         window_config=window_config,
         seed=random_seed + 1,
         question_pick_seed=question_pick_seed,
+        max_concurrency=max_concurrency,
     )
 
     _write_parquet(train_path, train_rows)

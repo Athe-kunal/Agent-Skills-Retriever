@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -45,6 +47,9 @@ FIELD_CONFIGS: dict[str, _FieldSearchConfig] = {
     ),
 }
 
+_ARTIFACTS_CACHE: dict[tuple[str, str], _SearchArtifacts] = {}
+_ARTIFACTS_CACHE_LOCK = threading.Lock()
+
 
 def _make_embedding_client(base_url: str, api_key: str) -> OpenAI:
     """Creates OpenAI-compatible client."""
@@ -52,8 +57,8 @@ def _make_embedding_client(base_url: str, api_key: str) -> OpenAI:
     return OpenAI(base_url=base_url, api_key=api_key)
 
 
-def _load_artifacts(root_dir: Path, field: str) -> _SearchArtifacts:
-    """Loads Chroma collection and BM25 payload path for a field."""
+def _load_artifacts_uncached(root_dir: Path, field: str) -> _SearchArtifacts:
+    """Loads artifacts without cache for one field."""
     config = FIELD_CONFIGS[field]
     db_path = root_dir / config.db_dir_name
     client = chromadb.PersistentClient(path=str(db_path))
@@ -61,6 +66,49 @@ def _load_artifacts(root_dir: Path, field: str) -> _SearchArtifacts:
     bm25_path = root_dir / "bm25" / f"{field}.json"
     log.info(f"{db_path=}, {bm25_path=}")
     return _SearchArtifacts(collection=collection, bm25_path=bm25_path)
+
+
+def _load_artifacts_with_retry(
+    root_dir: Path,
+    field: str,
+    max_attempts: int = 3,
+    retry_delay_seconds: float = 0.2,
+) -> _SearchArtifacts:
+    """Loads artifacts with retries for transient Chroma tenant connection errors."""
+    last_exception: ValueError | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return _load_artifacts_uncached(root_dir=root_dir, field=field)
+        except ValueError as error:
+            error_text = str(error)
+            is_tenant_error = "Could not connect to tenant" in error_text
+            if not is_tenant_error:
+                raise
+            last_exception = error
+            log.warning(f"{field=}, {attempt=}, {max_attempts=}, {error_text=}")
+            if attempt < max_attempts:
+                time.sleep(retry_delay_seconds)
+
+    if last_exception is None:
+        raise RuntimeError("Expected tenant retry exception but none was captured.")
+    raise last_exception
+
+
+def _load_artifacts(root_dir: Path, field: str) -> _SearchArtifacts:
+    """Loads Chroma collection and BM25 payload path for a field with cache."""
+    cache_key = (str(root_dir.resolve()), field)
+    with _ARTIFACTS_CACHE_LOCK:
+        cached_artifacts = _ARTIFACTS_CACHE.get(cache_key)
+        if cached_artifacts is not None:
+            return cached_artifacts
+
+    loaded_artifacts = _load_artifacts_with_retry(root_dir=root_dir, field=field)
+    with _ARTIFACTS_CACHE_LOCK:
+        cached_artifacts = _ARTIFACTS_CACHE.get(cache_key)
+        if cached_artifacts is not None:
+            return cached_artifacts
+        _ARTIFACTS_CACHE[cache_key] = loaded_artifacts
+    return loaded_artifacts
 
 
 def semantic_search(
