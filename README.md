@@ -115,3 +115,23 @@ Both training-time and standalone evaluation log:
 - `eval/queries`
 
 Training additionally logs per-epoch train counts.
+
+
+## Persona-driven prompt generation
+
+A dedicated module now exists at `ast_skills/persona_data_gen` for creating prompts used in
+persona-driven retrieval evaluation:
+
+- `persona_prompts.py`: prompt template to generate **5 personas** from one SKILL.md.
+- `query_prompts.py`: prompt template to generate **1 realistic user query** from
+  `(persona, SKILL.md)`.
+- `prompt_jobs.py`: CLI jobs that reuse the shared SKILL.md collection and token-budget
+  filtering from `ast_skills.data_gen.skills_data_collect.collect_english_skill_md_records`.
+
+Example usage:
+
+```bash
+uv run python -m ast_skills.persona_data_gen.prompt_jobs   build_persona_prompts --skills_root skills/skills --output_path outputs/persona_prompts.jsonl
+
+uv run python -m ast_skills.persona_data_gen.prompt_jobs   build_query_prompts --skills_root skills/skills   --persona_jsonl_path outputs/persona_outputs.jsonl   --output_path outputs/query_prompts.jsonl
+```
