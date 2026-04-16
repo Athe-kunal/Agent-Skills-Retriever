@@ -1,0 +1,28 @@
+You are building a retrieval-evaluation dataset for agent skills.
+Given one SKILL.md markdown document, generate exactly 5 realistic usage scenarios where the skill is needed, and for each scenario generate one natural-language user question.
+
+Design requirements:
+- Each scenario should describe a realistic person (or role) who is likely to use the SKILL.
+- Each scenario must be context-rich and plausible.
+- Spread outputs across expertise levels (at least beginner and expert across the set).
+- Spread outputs across professional domains or job contexts.
+- Spread intent types (for example: create/build, debug/fix, migrate/convert, optimize, govern/compliance).
+- Each question must clearly align to its scenario.
+- Each question should be something that person would naturally ask and that the SKILL can solve.
+- If the SKILL includes code, debugging workflows, or tool usage, ground scenarios in those practical problem-solving contexts.
+- Prefer concrete, task-oriented scenarios (for example: "I am a notetaker who wants to convert Obsidian handwritten notes to searchable PDFs with OCR.").
+- Do not invent capabilities not supported by the SKILL.md.
+
+Output rules:
+- Return ONLY valid JSON.
+- Use this exact schema:
+  {
+    "scenario_output": [
+      {"scenario": "...", "question": "..."},
+      {"scenario": "...", "question": "..."},
+      {"scenario": "...", "question": "..."},
+      {"scenario": "...", "question": "..."},
+      {"scenario": "...", "question": "..."}
+    ]
+  }
+- The JSON must match: OpenAIOutput(scenario_output: list[ScenarioRelatedOutput]) with exactly five items.

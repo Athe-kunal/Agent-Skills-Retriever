@@ -117,29 +117,22 @@ Both training-time and standalone evaluation log:
 Training additionally logs per-epoch train counts.
 
 
-## Persona-driven prompt generation
+## Scenario-driven prompt generation
 
 A dedicated module now exists at `ast_skills/persona_data_gen` for creating prompts used in
-persona-driven retrieval evaluation:
+scenario-driven retrieval evaluation:
 
-- `persona_prompts.py`: prompt template to generate **5 personas** from one SKILL.md.
-- `query_prompts.py`: prompt template to generate **1 realistic user query** from
-  `(persona, SKILL.md)`.
+- `scenario_prompts.py`: prompt template to generate **5 scenario + question pairs** from one
+  SKILL.md.
 - `prompt_jobs.py`: CLI jobs that reuse the shared SKILL.md collection and token-budget
   filtering from `ast_skills.data_gen.skills_data_collect.collect_english_skill_md_records`.
 
 Example usage:
 
 ```bash
-uv run python -m ast_skills.persona_data_gen.prompt_jobs build_persona_prompts \
-  --skills_root skills/skills --output_dir outputs/persona_batch_inputs
-
-uv run python -m ast_skills.persona_data_gen.prompt_jobs build_query_prompts \
-  --skills_root skills/skills \
-  --persona_jsonl_paths '["outputs/persona_batch_results/persona_generation_batch/batch_FILEID_output.jsonl"]' \
-  --output_dir outputs/query_batch_inputs
+uv run python -m ast_skills.persona_data_gen.prompt_jobs build_scenario_prompts \
+  --skills_root skills/skills --output_dir outputs/scenario_batch_inputs
 ```
 
 Batch input shards are written under ``output_dir`` as numbered files:
-``persona_generation_batch_1.jsonl``, ``persona_generation_batch_2.jsonl``, … and
-``query_generation_batch_1.jsonl``, ``query_generation_batch_2.jsonl``, …
+``scenario_generation_batch_1.jsonl``, ``scenario_generation_batch_2.jsonl``, …
