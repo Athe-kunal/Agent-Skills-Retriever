@@ -6,14 +6,13 @@ import pydantic
 
 
 class ModelOutput(pydantic.BaseModel):
-    """Structured LLM output for summary validation and question filtering."""
+    """Structured LLM output for question filtering."""
 
     model_config = pydantic.ConfigDict(extra="forbid")
 
     reasoning: str
-    filtered_summary: str
     filtered_questions: list[str] = pydantic.Field(
-        description="Exactly 5 questions copied verbatim from seed or scenario candidates.",
+        description="Exactly 5 questions copied verbatim from the candidates.",
         min_length=5,
         max_length=5,
     )
@@ -50,8 +49,8 @@ class ValidatedTrainingData:
     custom_id: str
     name: str
     markdown_content: str
-    filtered_summary: str
     description: str
+    reasoning: str
     filtered_questions: list[str]
     num_from_seed_questions: str
     num_from_scenario_questions: str
