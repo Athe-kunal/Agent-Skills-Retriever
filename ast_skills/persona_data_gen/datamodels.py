@@ -25,6 +25,18 @@ class ScenarioRelatedOutput(pydantic.BaseModel):
     scenario: str
     question: str
 
+@dataclass(frozen=True)
+class ScenarioQueryPromptRowDataModel:
+    """One retriever training row for summary-based retrieval."""
+
+    custom_id: str
+    markdown_content: str
+    seed_questions: list[str]
+    summary: str
+    name: str
+    description: str
+    metadata: dict[str, str]
+    scenario_output: list[ScenarioRelatedOutput]
 
 class OpenAIOutput(pydantic.BaseModel):
     """Structured model output for scenario-conditioned question generation."""
