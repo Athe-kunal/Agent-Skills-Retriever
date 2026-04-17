@@ -3,7 +3,6 @@ import fire
 
 import json
 from collections import defaultdict
-from dataclasses import asdict
 from pathlib import Path
 
 from loguru import logger as log
@@ -16,6 +15,7 @@ from ast_skills.persona_data_gen.datamodels import (
     ScenarioQueryPromptRowDataModel,
     ScenarioRelatedOutput,
 )
+from ast_skills.train.scenario_query_row_io import scenario_query_prompt_row_to_json_dict
 
 
 def _build_summary_retriever_data_models(path: str) -> dict[str,list[SummaryRetrieverDataModel]]:
@@ -71,15 +71,6 @@ def _build_scenario_query_prompt_row_data_models(
     return result
 
 
-def _scenario_query_prompt_row_to_json_dict(
-    row: ScenarioQueryPromptRowDataModel,
-) -> dict[str, object]:
-    """Serialize row with ``asdict``; ``scenario_output`` Pydantic models become dicts."""
-    payload: dict[str, object] = asdict(row)
-    payload["scenario_output"] = [item.model_dump() for item in row.scenario_output]
-    return payload
-
-
 def build_scenario_query_prompt_row_data_models(
     summary_retriever_jsonl_path: str = "artifacts/summary_retriever_models.jsonl",
     scenario_batch_output_directory: str = "data/scenario_batch_results",
@@ -130,7 +121,7 @@ def build_scenario_query_prompt_row_data_models(
     log.info(f"Built {len(combined)} ScenarioQueryPromptRowDataModel rows")
     with open(output_jsonl_path, "w", encoding="utf-8") as f:
         for row in combined:
-            f.write(json.dumps(_scenario_query_prompt_row_to_json_dict(row), ensure_ascii=False) + "\n")
+            f.write(json.dumps(scenario_query_prompt_row_to_json_dict(row), ensure_ascii=False) + "\n")
     # return combined
 
 
