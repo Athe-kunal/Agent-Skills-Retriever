@@ -32,3 +32,18 @@ class SummaryRetrieverDataModel:
     name: str
     description: str
     metadata: dict[str, str]
+
+
+@dataclass(frozen=True)
+class ValidatedSkillQuestionRow:
+    """Input row for validated skill-question retrieval evaluation."""
+
+    custom_id: str
+    description: str
+    filtered_questions: list[str]
+    markdown_content: str
+    name: str
+    num_from_scenario_questions: str
+    num_from_seed_questions: str
+    reasoning: str
+    summary: str = ""

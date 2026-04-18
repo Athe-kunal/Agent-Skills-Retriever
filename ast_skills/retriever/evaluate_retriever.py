@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import asyncio
 from pathlib import Path
-from typing import NamedTuple, Sequence
+from typing import Any, NamedTuple, Sequence
 
 import fire
 import numpy as np
@@ -22,12 +22,19 @@ import pandas as pd
 import wandb
 import yaml
 from loguru import logger as log
-from openai import AsyncOpenAI, OpenAI
+from openai import AsyncOpenAI
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 
 from ast_skills.data_gen.datamodels import TrainingData
-from ast_skills.retriever.datamodels import SummaryRetrieverDataModel
+from ast_skills.retriever.datamodels import (
+    SummaryRetrieverDataModel,
+    ValidatedSkillQuestionRow,
+)
+from ast_skills.retriever.maximal_marginal_relevance_question import (
+    MmrSelectionConfig,
+    select_diverse_questions_for_rows,
+)
 
 
 class RetrievalMetrics(NamedTuple):
@@ -37,6 +44,7 @@ class RetrievalMetrics(NamedTuple):
     hit_at_1: float
     hit_at_3: float
     hit_at_5: float
+    hit_at_10: float
     mrr: float
 
 
@@ -60,6 +68,13 @@ class _ValidationPayload(NamedTuple):
     rows: list[TrainingData]
     query_texts: list[str]
     expected_names: list[str]
+
+
+class _QuestionSplitRows(NamedTuple):
+    """Expanded rows after question-level train/validation split."""
+
+    train_rows: list[TrainingData]
+    validation_rows: list[TrainingData]
 
 
 class _EncodedCorpus(NamedTuple):
@@ -180,6 +195,135 @@ def _load_validation_payload(validation_parquet: str) -> _ValidationPayload:
     return payload
 
 
+def _read_validated_rows(input_jsonl: str) -> list[ValidatedSkillQuestionRow]:
+    """Loads validated skill rows from JSONL."""
+    raw_rows = _read_jsonl(Path(input_jsonl))
+    rows: list[ValidatedSkillQuestionRow] = []
+    for row in raw_rows:
+        rows.append(
+            ValidatedSkillQuestionRow(
+                custom_id=str(row["custom_id"]),
+                description=str(row["description"]),
+                filtered_questions=[
+                    str(question).strip()
+                    for question in row["filtered_questions"]
+                    if str(question).strip()
+                ],
+                markdown_content=str(row["markdown_content"]),
+                name=str(row["name"]),
+                num_from_scenario_questions=str(row["num_from_scenario_questions"]),
+                num_from_seed_questions=str(row["num_from_seed_questions"]),
+                reasoning=str(row["reasoning"]),
+                summary=str(row.get("summary", "")),
+            )
+        )
+    log.info(f"{input_jsonl=}, {len(rows)=}")
+    return rows
+
+
+def _summary_for_row(row: ValidatedSkillQuestionRow) -> str:
+    """Returns summary text for retrieval, falling back to description."""
+    normalized_summary = row.summary.strip()
+    if normalized_summary:
+        return normalized_summary
+    return row.description.strip()
+
+
+def _build_training_row(question: str, row: ValidatedSkillQuestionRow) -> TrainingData:
+    """Builds a ``TrainingData`` row with empty in-batch negatives."""
+    return TrainingData(
+        question=question.strip(),
+        name=row.name.strip(),
+        summary=_summary_for_row(row),
+        description=row.description.strip(),
+        in_batch_negatives_descriptions=[],
+        in_batch_negatives_summary=[],
+    )
+
+
+def _split_questions_for_row(
+    row: ValidatedSkillQuestionRow,
+    train_questions: Sequence[str],
+    validation_questions: Sequence[str],
+) -> _QuestionSplitRows:
+    """Builds split rows from preselected train/validation question groups."""
+    split_rows = _QuestionSplitRows(
+        train_rows=[
+            _build_training_row(question=question, row=row)
+            for question in train_questions
+        ],
+        validation_rows=[
+            _build_training_row(question=question, row=row)
+            for question in validation_questions
+        ],
+    )
+    log.info(
+        f"{row.custom_id=}, {row.name=}, {train_questions=}, {validation_questions=}"
+    )
+    return split_rows
+
+
+def _split_questions_dataset(
+    rows: Sequence[ValidatedSkillQuestionRow],
+    selected_questions_by_custom_id: dict[str, list[str]],
+    train_questions_per_skill: int,
+    validation_questions_per_skill: int,
+) -> _QuestionSplitRows:
+    """Splits all validated rows into question-level train and validation rows."""
+    total_selected_questions = (
+        train_questions_per_skill + validation_questions_per_skill
+    )
+    train_rows: list[TrainingData] = []
+    validation_rows: list[TrainingData] = []
+    for row in rows:
+        selected_questions = selected_questions_by_custom_id[row.custom_id]
+        if len(selected_questions) != total_selected_questions:
+            raise ValueError(
+                f"Invalid selected question count for {row.custom_id=}, "
+                f"{len(selected_questions)=}, {total_selected_questions=}"
+            )
+
+        train_questions = selected_questions[:train_questions_per_skill]
+        validation_questions = selected_questions[train_questions_per_skill:]
+        split_rows = _split_questions_for_row(
+            row=row,
+            train_questions=train_questions,
+            validation_questions=validation_questions,
+        )
+        train_rows.extend(split_rows.train_rows)
+        validation_rows.extend(split_rows.validation_rows)
+    payload = _QuestionSplitRows(train_rows=train_rows, validation_rows=validation_rows)
+    log.info(f"{len(train_rows)=}, {len(validation_rows)=}")
+    return payload
+
+
+def _write_training_data_parquet(path: Path, rows: Sequence[TrainingData]) -> None:
+    """Writes ``TrainingData`` rows into Parquet."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    dataframe = pd.DataFrame([row.__dict__ for row in rows])
+    dataframe.to_parquet(path)
+    log.info(f"{path=}, {len(rows)=}")
+
+
+def _build_split_result_payload(
+    train_parquet: str,
+    validation_parquet: str,
+    train_rows: Sequence[TrainingData],
+    validation_rows: Sequence[TrainingData],
+    validation_metrics: dict[str, dict[str, dict[str, float]]],
+) -> dict[str, Any]:
+    """Builds output payload for question-split and validation evaluation."""
+    payload: dict[str, Any] = {
+        "train_parquet": train_parquet,
+        "validation_parquet": validation_parquet,
+        "train_rows": len(train_rows),
+        "validation_rows": len(validation_rows),
+        "validation_metrics": validation_metrics,
+    }
+    log.info(f"{payload=}")
+    return payload
+
+
 def _text_for_field(row: TrainingData, field_key: str) -> str:
     """Returns text for ``summary`` or ``description`` field retrieval."""
     if field_key == "summary":
@@ -226,7 +370,9 @@ def _build_corpus(
 ) -> _CorpusPayload:
     """Builds retrieval corpus texts and skill names."""
     texts = [
-        _apply_instruction(row.summary.strip() or row.description.strip(), document_instruction)
+        _apply_instruction(
+            row.summary.strip() or row.description.strip(), document_instruction
+        )
         for row in rows
     ]
     names = [row.name.strip() for row in rows]
@@ -298,7 +444,11 @@ def _chunk_texts(texts: Sequence[str], batch_size: int) -> list[_TextChunk]:
     start_index = 0
     while start_index < len(texts):
         end_index = min(start_index + batch_size, len(texts))
-        chunks.append(_TextChunk(start_index=start_index, texts=list(texts[start_index:end_index])))
+        chunks.append(
+            _TextChunk(
+                start_index=start_index, texts=list(texts[start_index:end_index])
+            )
+        )
         start_index = end_index
     log.info(f"{len(texts)=}, {batch_size=}, {len(chunks)=}")
     return chunks
@@ -312,7 +462,9 @@ async def _fetch_embeddings_chunk(
 ) -> tuple[int, list[list[float]]]:
     """Requests one embeddings chunk under semaphore control."""
     async with semaphore:
-        response = await client.embeddings.create(model=embedding_model, input=text_chunk.texts)
+        response = await client.embeddings.create(
+            model=embedding_model, input=text_chunk.texts
+        )
     embeddings = [item.embedding for item in response.data]
     return text_chunk.start_index, embeddings
 
@@ -426,7 +578,9 @@ def _score_bm25(
     score_rows: list[np.ndarray] = []
     for query_text in query_texts:
         tokenized_query = _tokenize_for_bm25(query_text)
-        score_rows.append(np.asarray(bm25.get_scores(tokenized_query), dtype=np.float32))
+        score_rows.append(
+            np.asarray(bm25.get_scores(tokenized_query), dtype=np.float32)
+        )
     score_matrix = np.vstack(score_rows)
     log.info(f"{score_matrix.shape=}")
     return score_matrix
@@ -453,15 +607,23 @@ def _compute_metrics(
     """Computes hit@k and MRR from score matrix."""
     total_queries = len(expected_names)
     if total_queries == 0:
-        return RetrievalMetrics(total_queries=0, hit_at_1=0.0, hit_at_3=0.0, hit_at_5=0.0, mrr=0.0)
+        return RetrievalMetrics(
+            total_queries=0,
+            hit_at_1=0.0,
+            hit_at_3=0.0,
+            hit_at_5=0.0,
+            hit_at_10=0.0,
+            mrr=0.0,
+        )
 
     hit_1 = 0
     hit_3 = 0
     hit_5 = 0
+    hit_10 = 0
     reciprocal_rank_sum = 0.0
 
     for query_index, expected_name in enumerate(expected_names):
-        top_indices = np.argsort(-score_matrix[query_index])[:5]
+        top_indices = np.argsort(-score_matrix[query_index])[:10]
         rank = _find_expected_rank(
             top_indices=top_indices,
             corpus_names=corpus_names,
@@ -476,12 +638,15 @@ def _compute_metrics(
             hit_3 += 1
         if rank <= 5:
             hit_5 += 1
+        if rank <= 10:
+            hit_10 += 1
 
     metrics = RetrievalMetrics(
         total_queries=total_queries,
         hit_at_1=hit_1 / total_queries,
         hit_at_3=hit_3 / total_queries,
         hit_at_5=hit_5 / total_queries,
+        hit_at_10=hit_10 / total_queries,
         mrr=reciprocal_rank_sum / total_queries,
     )
     log.info(f"{metrics=}")
@@ -592,9 +757,13 @@ def _score_backend(
 
     if retrieval_backend == "late_interaction":
         if encoded_queries.token_embeddings is None:
-            raise ValueError("Token embeddings were missing for late-interaction scoring.")
+            raise ValueError(
+                "Token embeddings were missing for late-interaction scoring."
+            )
         if encoded_corpus.token_embeddings is None:
-            raise ValueError("Token embeddings were missing for late-interaction scoring.")
+            raise ValueError(
+                "Token embeddings were missing for late-interaction scoring."
+            )
         return _score_late_interaction(
             query_token_embeddings=encoded_queries.token_embeddings,
             doc_token_embeddings=encoded_corpus.token_embeddings,
@@ -709,6 +878,7 @@ def evaluate(
         "eval/hit_at_1": metrics.hit_at_1,
         "eval/hit_at_3": metrics.hit_at_3,
         "eval/hit_at_5": metrics.hit_at_5,
+        "eval/hit_at_10": metrics.hit_at_10,
         "eval/mrr": metrics.mrr,
     }
     log.info(f"{payload=}")
@@ -752,10 +922,13 @@ def _build_validation_payload(
     payload: dict[str, float] = {}
     for field_key, metrics_by_model in metrics_by_field.items():
         for model_key, metrics in metrics_by_model.items():
-            payload[f"eval/{field_key}/{model_key}/queries"] = float(metrics.total_queries)
+            payload[f"eval/{field_key}/{model_key}/queries"] = float(
+                metrics.total_queries
+            )
             payload[f"eval/{field_key}/{model_key}/hit_at_1"] = metrics.hit_at_1
             payload[f"eval/{field_key}/{model_key}/hit_at_3"] = metrics.hit_at_3
             payload[f"eval/{field_key}/{model_key}/hit_at_5"] = metrics.hit_at_5
+            payload[f"eval/{field_key}/{model_key}/hit_at_10"] = metrics.hit_at_10
             payload[f"eval/{field_key}/{model_key}/mrr"] = metrics.mrr
     log.info(f"{payload=}")
     return payload
@@ -852,16 +1025,135 @@ def evaluate_validation_parquet(
                     metrics.hit_at_1,
                     metrics.hit_at_3,
                     metrics.hit_at_5,
+                    metrics.hit_at_10,
                     metrics.mrr,
                 ]
             )
     table = wandb.Table(
-        columns=["field", "model", "queries", "hit_at_1", "hit_at_3", "hit_at_5", "mrr"],
+        columns=[
+            "field",
+            "model",
+            "queries",
+            "hit_at_1",
+            "hit_at_3",
+            "hit_at_5",
+            "hit_at_10",
+            "mrr",
+        ],
         data=table_rows,
     )
     wandb.log({"eval/model_comparison": table})
     wandb.finish()
     return _build_validation_output(metrics_by_field)
+
+
+async def evaluate_validated_skill_questions_async(
+    input_jsonl: str,
+    output_train_parquet: str = "artifacts/retriever_training/train.parquet",
+    output_validation_parquet: str = "artifacts/retriever_training/validation.parquet",
+    train_questions_per_skill: int = 2,
+    validation_questions_per_skill: int = 1,
+    vllm_base_url: str = "http://127.0.0.1:8000/v1",
+    vllm_api_key: str = "EMPTY",
+    vllm_embedding_model: str = "Qwen/Qwen3-Embedding-0.6B",
+    vllm_batch_size: int = 64,
+    vllm_max_concurrency: int = 8,
+    wandb_project: str = "ast-skills-retriever",
+    wandb_entity: str = "",
+    run_name: str = "validated-questions-parquet-eval",
+    sentence_batch_size: int = 64,
+) -> dict[str, Any]:
+    """Runs MMR question selection, parquet creation, and validation evaluation."""
+    total_selected_questions = (
+        train_questions_per_skill + validation_questions_per_skill
+    )
+    if total_selected_questions != 3:
+        raise ValueError(
+            "This workflow requires exactly 3 selected MMR questions per row."
+        )
+
+    validated_rows = _read_validated_rows(input_jsonl=input_jsonl)
+    mmr_config = MmrSelectionConfig(
+        base_url=vllm_base_url,
+        api_key=vllm_api_key,
+        embedding_model=vllm_embedding_model,
+        mmr_lambda=0.5,
+        selected_question_count=total_selected_questions,
+        batch_size=vllm_batch_size,
+        max_concurrency=vllm_max_concurrency,
+    )
+    selected_questions_by_custom_id = await select_diverse_questions_for_rows(
+        rows=validated_rows,
+        config=mmr_config,
+    )
+    split_rows = _split_questions_dataset(
+        rows=validated_rows,
+        selected_questions_by_custom_id=selected_questions_by_custom_id,
+        train_questions_per_skill=train_questions_per_skill,
+        validation_questions_per_skill=validation_questions_per_skill,
+    )
+    await asyncio.to_thread(
+        _write_training_data_parquet,
+        Path(output_train_parquet),
+        split_rows.train_rows,
+    )
+    await asyncio.to_thread(
+        _write_training_data_parquet,
+        Path(output_validation_parquet),
+        split_rows.validation_rows,
+    )
+    validation_metrics = await asyncio.to_thread(
+        evaluate_validation_parquet,
+        validation_parquet=output_validation_parquet,
+        wandb_project=wandb_project,
+        wandb_entity=wandb_entity,
+        run_name=run_name,
+        sentence_batch_size=sentence_batch_size,
+    )
+    return _build_split_result_payload(
+        train_parquet=output_train_parquet,
+        validation_parquet=output_validation_parquet,
+        train_rows=split_rows.train_rows,
+        validation_rows=split_rows.validation_rows,
+        validation_metrics=validation_metrics,
+    )
+
+
+def evaluate_validated_skill_questions(
+    input_jsonl: str,
+    output_train_parquet: str = "artifacts/retriever_training/train.parquet",
+    output_validation_parquet: str = "artifacts/retriever_training/validation.parquet",
+    train_questions_per_skill: int = 2,
+    validation_questions_per_skill: int = 1,
+    vllm_base_url: str = "http://127.0.0.1:8000/v1",
+    vllm_api_key: str = "EMPTY",
+    vllm_embedding_model: str = "Qwen/Qwen3-Embedding-0.6B",
+    vllm_batch_size: int = 64,
+    vllm_max_concurrency: int = 8,
+    wandb_project: str = "ast-skills-retriever",
+    wandb_entity: str = "",
+    run_name: str = "validated-questions-parquet-eval",
+    sentence_batch_size: int = 64,
+) -> dict[str, Any]:
+    """Sync CLI wrapper for async validated-question evaluation workflow."""
+    return asyncio.run(
+        evaluate_validated_skill_questions_async(
+            input_jsonl=input_jsonl,
+            output_train_parquet=output_train_parquet,
+            output_validation_parquet=output_validation_parquet,
+            train_questions_per_skill=train_questions_per_skill,
+            validation_questions_per_skill=validation_questions_per_skill,
+            vllm_base_url=vllm_base_url,
+            vllm_api_key=vllm_api_key,
+            vllm_embedding_model=vllm_embedding_model,
+            vllm_batch_size=vllm_batch_size,
+            vllm_max_concurrency=vllm_max_concurrency,
+            wandb_project=wandb_project,
+            wandb_entity=wandb_entity,
+            run_name=run_name,
+            sentence_batch_size=sentence_batch_size,
+        )
+    )
 
 
 def main() -> None:
@@ -871,6 +1163,7 @@ def main() -> None:
             "evaluate": evaluate,
             "evaluate_from_config": evaluate_from_config,
             "evaluate_validation_parquet": evaluate_validation_parquet,
+            "evaluate_validated_skill_questions": evaluate_validated_skill_questions,
         }
     )
 
