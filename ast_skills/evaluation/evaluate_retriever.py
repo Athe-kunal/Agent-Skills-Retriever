@@ -140,6 +140,13 @@ class _ChromaCorpusArtifacts(NamedTuple):
     names: list[str]
 
 
+class _BM25CachePayload(NamedTuple):
+    """Cached BM25 corpus texts and their corresponding skill names."""
+
+    texts: list[str]
+    names: list[str]
+
+
 def _read_jsonl(path: Path) -> list[dict]:
     """Reads JSONL records from ``path``."""
     rows: list[dict] = []
@@ -469,8 +476,8 @@ def _sanitize_model_name(model_name: str) -> str:
 def _build_collection_name(
     field_key: str, *, sanitized_model_name: str
 ) -> str:
-    """Builds Chroma collection name: field key plus sanitized embedding model id."""
-    collection_name = f"{field_key}_{sanitized_model_name}"
+    """Builds Chroma collection name: sanitized model id plus field key."""
+    collection_name = f"{sanitized_model_name}_{field_key}"
     log.info(f"{field_key=}, {sanitized_model_name=}, {collection_name=}")
     return collection_name
 
@@ -814,22 +821,25 @@ def _load_or_write_bm25_docs(
     field_key: str,
     corpus: _CorpusPayload,
     force_reindex: bool,
-) -> list[str]:
-    """Loads cached BM25 docs or writes cache from current corpus."""
+) -> _BM25CachePayload:
+    """Loads cached BM25 docs and names, or writes cache from current corpus."""
     bm25_cache_path = _build_bm25_cache_path(
         artifacts_root=artifacts_root, field_key=field_key
     )
     if bm25_cache_path.exists() and not force_reindex:
         payload = json.loads(bm25_cache_path.read_text(encoding="utf-8"))
-        documents = [str(item) for item in payload.get("documents", corpus.texts)]
-        log.info(f"{bm25_cache_path=}, loaded_from_cache=True, {len(documents)=}")
-        return documents
+        if "names" in payload:
+            documents = [str(item) for item in payload["documents"]]
+            names = [str(item) for item in payload["names"]]
+            log.info(f"{bm25_cache_path=}, loaded_from_cache=True, {len(documents)=}")
+            return _BM25CachePayload(texts=documents, names=names)
+        log.info(f"{bm25_cache_path=}, names_missing=True, rebuilding cache")
 
     bm25_cache_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"documents": corpus.texts}
+    payload = {"documents": corpus.texts, "names": corpus.names}
     bm25_cache_path.write_text(json.dumps(payload), encoding="utf-8")
     log.info(f"{bm25_cache_path=}, loaded_from_cache=False, {len(corpus.texts)=}")
-    return corpus.texts
+    return _BM25CachePayload(texts=corpus.texts, names=corpus.names)
 
 
 def _find_expected_rank(
@@ -1316,6 +1326,73 @@ def _maybe_start_vllm_server(
     return process
 
 
+def _chroma_collection_doc_count(
+    artifacts_root: str,
+    model_name: str,
+    field_key: str,
+) -> int:
+    """Returns doc count for a Chroma collection, or 0 if the collection is missing."""
+    sanitized_model_name = _sanitize_model_name(model_name=model_name)
+    chroma_path = Path(artifacts_root) / "chroma_validation" / sanitized_model_name
+    if not chroma_path.exists():
+        log.info(f"{chroma_path=}, exists=False")
+        return 0
+    client = chromadb.PersistentClient(path=str(chroma_path))
+    collection_name = _build_collection_name(
+        field_key=field_key, sanitized_model_name=sanitized_model_name
+    )
+    try:
+        count = client.get_collection(name=collection_name).count()
+        log.info(f"{collection_name=}, {count=}")
+        return count
+    except Exception:
+        log.info(f"{collection_name=}, collection_not_found=True")
+        return 0
+
+
+def _all_chroma_collections_cached(
+    artifacts_root: str,
+    model_name: str,
+    force_reindex: bool,
+) -> bool:
+    """Returns True when every field collection has docs and force_reindex is off."""
+    if force_reindex:
+        return False
+    return all(
+        _chroma_collection_doc_count(artifacts_root, model_name, fc.field_key) > 0
+        for fc in VALIDATION_FIELD_CONFIGS
+    )
+
+
+def _encode_texts_for_indexing(
+    texts: Sequence[str],
+    model_name: str,
+    use_hf_encoder: bool,
+    batch_size: int,
+    vllm_base_url: str,
+    vllm_api_key: str,
+    vllm_max_concurrency: int,
+    progress_desc: str,
+) -> np.ndarray:
+    """Encodes corpus texts for Chroma indexing via HF transformers or vLLM."""
+    if use_hf_encoder:
+        assets = _load_hf_encoder(model_name=model_name)
+        return _encode_hf_sentence_embeddings(
+            assets=assets, texts=texts, batch_size=batch_size
+        )
+    client = AsyncOpenAI(base_url=vllm_base_url, api_key=vllm_api_key)
+    return asyncio.run(
+        _encode_vllm_async(
+            client=client,
+            embedding_model=model_name,
+            texts=texts,
+            batch_size=batch_size,
+            max_concurrency=vllm_max_concurrency,
+            progress_desc=progress_desc,
+        )
+    )
+
+
 def _load_chroma_corpus_artifacts(
     artifacts_root: str,
     field_key: str,
@@ -1326,6 +1403,7 @@ def _load_chroma_corpus_artifacts(
     vllm_base_url: str,
     vllm_api_key: str,
     vllm_max_concurrency: int,
+    use_hf_encoder: bool = False,
 ) -> _ChromaCorpusArtifacts:
     """Loads cached corpus embeddings from Chroma or indexes them once."""
     sanitized_model_name = _sanitize_model_name(model_name=model_name)
@@ -1353,16 +1431,15 @@ def _load_chroma_corpus_artifacts(
         existing_ids = collection.get(include=[], limit=current_count).get("ids", [])
         collection.delete(ids=existing_ids)
 
-    client_async = AsyncOpenAI(base_url=vllm_base_url, api_key=vllm_api_key)
-    embeddings = asyncio.run(
-        _encode_vllm_async(
-            client=client_async,
-            embedding_model=model_name,
-            texts=corpus.texts,
-            batch_size=batch_size,
-            max_concurrency=vllm_max_concurrency,
-            progress_desc=f"Chroma corpus embeddings ({field_key})",
-        )
+    embeddings = _encode_texts_for_indexing(
+        texts=corpus.texts,
+        model_name=model_name,
+        use_hf_encoder=use_hf_encoder,
+        batch_size=batch_size,
+        vllm_base_url=vllm_base_url,
+        vllm_api_key=vllm_api_key,
+        vllm_max_concurrency=vllm_max_concurrency,
+        progress_desc=f"Chroma corpus embeddings ({field_key})",
     )
     ids = [f"{field_key}_{index}" for index in range(len(corpus.texts))]
     metadatas = [{"name": name} for name in corpus.names]
@@ -1432,10 +1509,12 @@ def evaluate_validation_parquet(
     run_name: str = "validation-parquet-eval",
     sentence_batch_size: int = 64,
     max_validation_rows: int = 0,
+    use_hf_encoder: bool = False,
 ) -> dict[str, dict[str, dict[str, float]]]:
     """Evaluates summary/description retrieval on validation parquet.
 
-    Runs BERT large encoder, Qwen3-0.6B, and BM25 across both retrieval fields.
+    Runs the given retrieval_model (vLLM or HuggingFace) and BM25 across both
+    retrieval fields (summary and description).
     """
     vllm_process = _maybe_start_vllm_server(
         model_name=retrieval_model,
@@ -1467,6 +1546,26 @@ def evaluate_validation_parquet(
         ),
     )
 
+    if use_hf_encoder:
+        hf_assets = _load_hf_encoder(model_name=retrieval_model)
+        query_embeddings = _encode_hf_sentence_embeddings(
+            assets=hf_assets,
+            texts=validation_payload.query_texts,
+            batch_size=sentence_batch_size,
+        )
+    else:
+        query_client = AsyncOpenAI(base_url=vllm_base_url, api_key=vllm_api_key)
+        query_embeddings = asyncio.run(
+            _encode_vllm_async(
+                client=query_client,
+                embedding_model=retrieval_model,
+                texts=validation_payload.query_texts,
+                batch_size=vllm_batch_size,
+                max_concurrency=vllm_max_concurrency,
+                progress_desc="Validation query embeddings",
+            )
+        )
+
     try:
         for field_config in VALIDATION_FIELD_CONFIGS:
             field_key = field_config.field_key
@@ -1486,17 +1585,7 @@ def evaluate_validation_parquet(
                 vllm_base_url=vllm_base_url,
                 vllm_api_key=vllm_api_key,
                 vllm_max_concurrency=vllm_max_concurrency,
-            )
-            query_client = AsyncOpenAI(base_url=vllm_base_url, api_key=vllm_api_key)
-            query_embeddings = asyncio.run(
-                _encode_vllm_async(
-                    client=query_client,
-                    embedding_model=retrieval_model,
-                    texts=validation_payload.query_texts,
-                    batch_size=vllm_batch_size,
-                    max_concurrency=vllm_max_concurrency,
-                    progress_desc="Validation query embeddings",
-                )
+                use_hf_encoder=use_hf_encoder,
             )
             dense_score_matrix = _score_bi_encoder(
                 query_embeddings=query_embeddings,
@@ -1509,7 +1598,7 @@ def evaluate_validation_parquet(
             )
             metrics_by_model[_sanitize_model_name(retrieval_model)] = dense_metrics
 
-            bm25_doc_texts = _load_or_write_bm25_docs(
+            bm25_cache = _load_or_write_bm25_docs(
                 artifacts_root=artifacts_root,
                 field_key=field_key,
                 corpus=corpus,
@@ -1517,12 +1606,12 @@ def evaluate_validation_parquet(
             )
             bm25_score_matrix = _score_bm25(
                 query_texts=validation_payload.query_texts,
-                doc_texts=bm25_doc_texts,
+                doc_texts=bm25_cache.texts,
             )
             bm25_metrics = _compute_metrics(
                 score_matrix=bm25_score_matrix,
                 expected_names=validation_payload.expected_names,
-                corpus_names=corpus.names,
+                corpus_names=bm25_cache.names,
             )
             metrics_by_model["bm25"] = bm25_metrics
             metrics_by_field[field_key] = metrics_by_model
@@ -1578,8 +1667,39 @@ def build_validation_indexes(
     vllm_gpu_device: int = 3,
     vllm_port: int = 8000,
     vllm_gpu_memory_utilization: float = 0.9,
+    use_hf_encoder: bool = False,
 ) -> dict[str, dict[str, int]]:
     """Builds and caches Chroma and BM25 artifacts for validation retrieval."""
+    validation_payload = _load_validation_payload(validation_parquet=validation_parquet)
+    output: dict[str, dict[str, int]] = {}
+    all_cached = _all_chroma_collections_cached(
+        artifacts_root=artifacts_root,
+        model_name=retrieval_model,
+        force_reindex=force_reindex,
+    )
+    log.info(f"{retrieval_model=}, {all_cached=}, {force_reindex=}")
+
+    if all_cached:
+        for field_config in VALIDATION_FIELD_CONFIGS:
+            field_key = field_config.field_key
+            corpus = _build_validation_corpus(
+                rows=validation_payload.rows, field_key=field_key
+            )
+            bm25_cache = _load_or_write_bm25_docs(
+                artifacts_root=artifacts_root,
+                field_key=field_key,
+                corpus=corpus,
+                force_reindex=force_reindex,
+            )
+            output[field_key] = {
+                "chroma_docs": _chroma_collection_doc_count(
+                    artifacts_root, retrieval_model, field_key
+                ),
+                "bm25_docs": len(bm25_cache.texts),
+            }
+        log.info(f"{output=}")
+        return output
+
     vllm_process = _maybe_start_vllm_server(
         model_name=retrieval_model,
         vllm_port=vllm_port,
@@ -1589,9 +1709,6 @@ def build_validation_indexes(
         vllm_base_url=vllm_base_url,
         vllm_api_key=vllm_api_key,
     )
-    validation_payload = _load_validation_payload(validation_parquet=validation_parquet)
-    output: dict[str, dict[str, int]] = {}
-
     try:
         for field_config in VALIDATION_FIELD_CONFIGS:
             field_key = field_config.field_key
@@ -1609,8 +1726,9 @@ def build_validation_indexes(
                 vllm_base_url=vllm_base_url,
                 vllm_api_key=vllm_api_key,
                 vllm_max_concurrency=vllm_max_concurrency,
+                use_hf_encoder=use_hf_encoder,
             )
-            bm25_docs = _load_or_write_bm25_docs(
+            bm25_cache = _load_or_write_bm25_docs(
                 artifacts_root=artifacts_root,
                 field_key=field_key,
                 corpus=corpus,
@@ -1618,7 +1736,7 @@ def build_validation_indexes(
             )
             output[field_key] = {
                 "chroma_docs": int(chroma_artifacts.embeddings.shape[0]),
-                "bm25_docs": len(bm25_docs),
+                "bm25_docs": len(bm25_cache.texts),
             }
     finally:
         if vllm_process is not None:

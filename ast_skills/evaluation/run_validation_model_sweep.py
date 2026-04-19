@@ -51,6 +51,15 @@ def _max_validation_rows_for_mode(mode: str) -> int:
     raise ValueError("mode must be either 'smoke' or 'full'.")
 
 
+def _parse_models(models: str | None) -> tuple[str, ...]:
+    """Returns model list from comma-separated string, or DEFAULT_MODELS if empty."""
+    if not models or not models.strip():
+        return DEFAULT_MODELS
+    parsed = tuple(m.strip() for m in models.split(",") if m.strip())
+    log.info(f"{models=}, {parsed=}")
+    return parsed
+
+
 def _run_for_model(model_name: str, config: _SweepConfig) -> dict:
     """Builds indexes and runs evaluation for one model."""
     log.info(f"{model_name=}, {config.mode=}, {config.force_reindex=}")
@@ -111,8 +120,14 @@ def run_model_sweep(
     wandb_project: str = "ast-skills-retriever",
     wandb_entity: str = "",
     run_name_prefix: str = "validation-model-sweep",
+    models: str = "",
 ) -> dict[str, dict]:
-    """Runs validation retrieval indexing and evaluation for all configured models."""
+    """Runs validation retrieval indexing and evaluation for the given models.
+
+    Args:
+      models: Comma-separated model names to sweep. Defaults to all DEFAULT_MODELS.
+    """
+    model_list = _parse_models(models)
     config = _SweepConfig(
         validation_parquet=validation_parquet,
         artifacts_root=artifacts_root,
@@ -131,11 +146,15 @@ def run_model_sweep(
         run_name_prefix=run_name_prefix,
     )
     output_by_model: dict[str, dict] = {}
-    for model_name in DEFAULT_MODELS:
-        output_by_model[model_name] = _run_for_model(
-            model_name=model_name,
-            config=config,
-        )
+    for model_name in model_list:
+        try:
+            output_by_model[model_name] = _run_for_model(
+                model_name=model_name,
+                config=config,
+            )
+        except Exception as exc:
+            log.error(f"{model_name=}, sweep_failed=True, {exc=}")
+            output_by_model[model_name] = {"error": str(exc)}
     log.info(f"{output_by_model=}")
     return output_by_model
 

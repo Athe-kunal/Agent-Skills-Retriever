@@ -30,6 +30,7 @@ EVAL_START_VLLM ?= true
 EVAL_VLLM_GPU ?= 3
 EVAL_MAX_VAL_ROWS ?= 0
 EVAL_MODE ?= smoke
+EVAL_MODELS ?=
 
 .PHONY: vllm-embd-serve
 vllm-embd-serve:
@@ -120,4 +121,5 @@ retriever-evaluate-model-sweep:
 		--mode $(EVAL_MODE) \
 		--force_reindex $(EVAL_FORCE_REINDEX) \
 		--start_vllm_server $(EVAL_START_VLLM) \
-		--vllm_gpu_device $(EVAL_VLLM_GPU)
+		--vllm_gpu_device $(EVAL_VLLM_GPU) \
+		--models "$(EVAL_MODELS)"
