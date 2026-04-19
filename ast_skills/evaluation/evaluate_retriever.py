@@ -1364,6 +1364,31 @@ def _all_chroma_collections_cached(
     )
 
 
+def get_validation_index_status(
+    artifacts_root: str,
+    retrieval_model: str,
+) -> dict[str, int]:
+    """Returns Chroma document counts for validation fields.
+
+    Args:
+      artifacts_root: Root folder that stores Chroma validation artifacts.
+      retrieval_model: Embedding model name.
+
+    Returns:
+      Mapping of field key to Chroma document count.
+    """
+    index_status: dict[str, int] = {}
+    for field_config in VALIDATION_FIELD_CONFIGS:
+        field_key = field_config.field_key
+        index_status[field_key] = _chroma_collection_doc_count(
+            artifacts_root=artifacts_root,
+            model_name=retrieval_model,
+            field_key=field_key,
+        )
+    log.info(f"{retrieval_model=}, {index_status=}")
+    return index_status
+
+
 def _encode_texts_for_indexing(
     texts: Sequence[str],
     model_name: str,
@@ -1510,11 +1535,12 @@ def evaluate_validation_parquet(
     sentence_batch_size: int = 64,
     max_validation_rows: int = 0,
     use_hf_encoder: bool = False,
+    include_bm25: bool = True,
 ) -> dict[str, dict[str, dict[str, float]]]:
     """Evaluates summary/description retrieval on validation parquet.
 
-    Runs the given retrieval_model (vLLM or HuggingFace) and BM25 across both
-    retrieval fields (summary and description).
+    Runs the given retrieval_model (vLLM or HuggingFace) across both
+    retrieval fields (summary and description). BM25 is optional.
     """
     vllm_process = _maybe_start_vllm_server(
         model_name=retrieval_model,
@@ -1598,22 +1624,23 @@ def evaluate_validation_parquet(
             )
             metrics_by_model[_sanitize_model_name(retrieval_model)] = dense_metrics
 
-            bm25_cache = _load_or_write_bm25_docs(
-                artifacts_root=artifacts_root,
-                field_key=field_key,
-                corpus=corpus,
-                force_reindex=force_reindex,
-            )
-            bm25_score_matrix = _score_bm25(
-                query_texts=validation_payload.query_texts,
-                doc_texts=bm25_cache.texts,
-            )
-            bm25_metrics = _compute_metrics(
-                score_matrix=bm25_score_matrix,
-                expected_names=validation_payload.expected_names,
-                corpus_names=bm25_cache.names,
-            )
-            metrics_by_model["bm25"] = bm25_metrics
+            if include_bm25:
+                bm25_cache = _load_or_write_bm25_docs(
+                    artifacts_root=artifacts_root,
+                    field_key=field_key,
+                    corpus=corpus,
+                    force_reindex=force_reindex,
+                )
+                bm25_score_matrix = _score_bm25(
+                    query_texts=validation_payload.query_texts,
+                    doc_texts=bm25_cache.texts,
+                )
+                bm25_metrics = _compute_metrics(
+                    score_matrix=bm25_score_matrix,
+                    expected_names=validation_payload.expected_names,
+                    corpus_names=bm25_cache.names,
+                )
+                metrics_by_model["bm25"] = bm25_metrics
             metrics_by_field[field_key] = metrics_by_model
     finally:
         if vllm_process is not None:
@@ -1652,6 +1679,96 @@ def evaluate_validation_parquet(
     wandb.log({"eval/model_comparison": table})
     wandb.finish()
     return _build_validation_output(metrics_by_field)
+
+
+def evaluate_validation_bm25_parquet(
+    validation_parquet: str = "artifacts/val.parquet",
+    force_reindex: bool = False,
+    artifacts_root: str = "artifacts",
+    wandb_project: str = "ast-skills-retriever",
+    wandb_entity: str = "",
+    run_name: str = "validation-parquet-eval-bm25",
+    max_validation_rows: int = 0,
+) -> dict[str, dict[str, dict[str, float]]]:
+    """Evaluates BM25 on summary/description retrieval for validation parquet."""
+    validation_payload = _load_validation_payload(validation_parquet=validation_parquet)
+    validation_payload = _slice_validation_payload(
+        payload=validation_payload,
+        max_validation_rows=max_validation_rows,
+    )
+    metrics_by_field: dict[str, dict[str, RetrievalMetrics]] = {}
+
+    wandb.init(
+        project=wandb_project,
+        entity=wandb_entity or None,
+        name=run_name,
+        config=_build_validation_wandb_config(
+            validation_parquet=validation_parquet,
+            run_name=run_name,
+            sentence_batch_size=0,
+            retrieval_model="bm25",
+            force_reindex=force_reindex,
+            max_validation_rows=max_validation_rows,
+        ),
+    )
+
+    for field_config in VALIDATION_FIELD_CONFIGS:
+        field_key = field_config.field_key
+        corpus = _build_validation_corpus(
+            rows=validation_payload.rows,
+            field_key=field_key,
+        )
+        bm25_cache = _load_or_write_bm25_docs(
+            artifacts_root=artifacts_root,
+            field_key=field_key,
+            corpus=corpus,
+            force_reindex=force_reindex,
+        )
+        bm25_score_matrix = _score_bm25(
+            query_texts=validation_payload.query_texts,
+            doc_texts=bm25_cache.texts,
+        )
+        bm25_metrics = _compute_metrics(
+            score_matrix=bm25_score_matrix,
+            expected_names=validation_payload.expected_names,
+            corpus_names=bm25_cache.names,
+        )
+        metrics_by_field[field_key] = {"bm25": bm25_metrics}
+
+    wandb.log(_build_validation_payload(metrics_by_field))
+    table_rows = []
+    for field_key, metrics_by_model in metrics_by_field.items():
+        for model_key, metrics in metrics_by_model.items():
+            table_rows.append(
+                [
+                    field_key,
+                    model_key,
+                    metrics.total_queries,
+                    metrics.hit_at_1,
+                    metrics.hit_at_3,
+                    metrics.hit_at_5,
+                    metrics.hit_at_10,
+                    metrics.mrr,
+                ]
+            )
+    table = wandb.Table(
+        columns=[
+            "field",
+            "model",
+            "queries",
+            "hit_at_1",
+            "hit_at_3",
+            "hit_at_5",
+            "hit_at_10",
+            "mrr",
+        ],
+        data=table_rows,
+    )
+    wandb.log({"eval/model_comparison": table})
+    wandb.finish()
+    output = _build_validation_output(metrics_by_field)
+    log.info(f"{output=}")
+    return output
 
 
 def build_validation_indexes(
