@@ -149,6 +149,12 @@ class _BM25CachePayload(NamedTuple):
     names: list[str]
 
 
+class _HybridRrfConfig(NamedTuple):
+    """RRF settings used to combine dense and BM25 rankings."""
+
+    rrf_k: int
+
+
 def _require_sentence_transformers() -> Any:
     """Loads ``sentence_transformers`` lazily for optional dependency support."""
     try:
@@ -834,6 +840,39 @@ def _score_bm25(
     score_matrix = np.vstack(score_rows)
     log.info(f"{score_matrix.shape=}")
     return score_matrix
+
+
+def _rank_positions_from_scores(score_matrix: np.ndarray) -> np.ndarray:
+    """Returns per-query rank positions for each document index."""
+    sorted_indices = np.argsort(-score_matrix, axis=1, kind="stable")
+    rank_positions = np.empty_like(sorted_indices)
+    row_indices = np.arange(score_matrix.shape[0])[:, None]
+    rank_positions[row_indices, sorted_indices] = np.arange(
+        score_matrix.shape[1], dtype=np.int32
+    )
+    log.info(f"{score_matrix.shape=}, {rank_positions.shape=}")
+    return rank_positions
+
+
+def _score_hybrid_rrf(
+    dense_score_matrix: np.ndarray,
+    bm25_score_matrix: np.ndarray,
+    config: _HybridRrfConfig,
+) -> np.ndarray:
+    """Combines dense and BM25 rankings using reciprocal rank fusion."""
+    if dense_score_matrix.shape != bm25_score_matrix.shape:
+        raise ValueError("Dense and BM25 score matrices must share the same shape.")
+    dense_ranks = _rank_positions_from_scores(score_matrix=dense_score_matrix)
+    bm25_ranks = _rank_positions_from_scores(score_matrix=bm25_score_matrix)
+    rrf_k_float = float(config.rrf_k)
+    dense_rrf = 1.0 / (rrf_k_float + dense_ranks.astype(np.float32) + 1.0)
+    bm25_rrf = 1.0 / (rrf_k_float + bm25_ranks.astype(np.float32) + 1.0)
+    hybrid_scores = dense_rrf + bm25_rrf
+    log.info(
+        f"{dense_score_matrix.shape=}, {bm25_score_matrix.shape=}, "
+        f"{config.rrf_k=}, {hybrid_scores.shape=}"
+    )
+    return hybrid_scores
 
 
 def _build_bm25_cache_path(artifacts_root: str, field_key: str) -> Path:
@@ -1575,12 +1614,14 @@ def evaluate_validation_parquet(
     sentence_batch_size: int = 64,
     max_validation_rows: int = 0,
     use_hf_encoder: bool = False,
-    include_bm25: bool = True,
+    include_hybrid: bool = True,
+    hybrid_rrf_k: int = 60,
 ) -> dict[str, dict[str, dict[str, float]]]:
     """Evaluates summary/description retrieval on validation parquet.
 
     Runs the given retrieval_model (vLLM or HuggingFace) across both
-    retrieval fields (summary and description). BM25 is optional.
+    retrieval fields (summary and description). Dense metrics always run,
+    and hybrid metrics (dense + BM25 via RRF) are enabled by default.
     """
     if not vllm_base_url:
         vllm_base_url = f"http://127.0.0.1:{vllm_port}/v1"
@@ -1664,9 +1705,9 @@ def evaluate_validation_parquet(
                 expected_names=validation_payload.expected_names,
                 corpus_names=chroma_artifacts.names,
             )
-            metrics_by_model[_sanitize_model_name(retrieval_model)] = dense_metrics
+            metrics_by_model["dense"] = dense_metrics
 
-            if include_bm25:
+            if include_hybrid:
                 bm25_cache = _load_or_write_bm25_docs(
                     artifacts_root=artifacts_root,
                     field_key=field_key,
@@ -1682,7 +1723,21 @@ def evaluate_validation_parquet(
                     expected_names=validation_payload.expected_names,
                     corpus_names=bm25_cache.names,
                 )
-                metrics_by_model["bm25"] = bm25_metrics
+                hybrid_score_matrix = _score_hybrid_rrf(
+                    dense_score_matrix=dense_score_matrix,
+                    bm25_score_matrix=bm25_score_matrix,
+                    config=_HybridRrfConfig(rrf_k=hybrid_rrf_k),
+                )
+                hybrid_metrics = _compute_metrics(
+                    score_matrix=hybrid_score_matrix,
+                    expected_names=validation_payload.expected_names,
+                    corpus_names=bm25_cache.names,
+                )
+                metrics_by_model["hybrid"] = hybrid_metrics
+                log.info(
+                    f"{field_key=}, {dense_metrics=}, {bm25_metrics=}, "
+                    f"{hybrid_metrics=}"
+                )
             metrics_by_field[field_key] = metrics_by_model
     finally:
         if vllm_process is not None:
