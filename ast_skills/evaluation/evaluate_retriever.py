@@ -15,8 +15,8 @@ import dataclasses
 import json
 import asyncio
 import os
-import random
 import re
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -1067,7 +1067,8 @@ def evaluate(
     wandb_project: str = "ast-skills-retriever",
     wandb_entity: str = "",
     run_name: str = "retriever-baseline-eval",
-    vllm_base_url: str = "http://127.0.0.1:8000/v1",
+    vllm_port: int = 8002,
+    vllm_base_url: str = "",
     vllm_api_key: str = "EMPTY",
     vllm_batch_size: int = 64,
     vllm_max_concurrency: int = 8,
@@ -1084,7 +1085,8 @@ def evaluate(
       wandb_project: W&B project name.
       wandb_entity: Optional W&B entity.
       run_name: W&B run name.
-      vllm_base_url: OpenAI-compatible vLLM endpoint.
+      vllm_port: Port for the vLLM server.
+      vllm_base_url: OpenAI-compatible vLLM endpoint. Derived from vllm_port when empty.
       vllm_api_key: API key for vLLM endpoint.
       vllm_batch_size: Batch size for vLLM embedding requests.
       vllm_max_concurrency: Max concurrent requests for async vLLM embedding calls.
@@ -1093,6 +1095,8 @@ def evaluate(
     Returns:
       Dict of scalar metrics.
     """
+    if not vllm_base_url:
+        vllm_base_url = f"http://127.0.0.1:{vllm_port}/v1"
     rows = _load_rows(dataset_jsonl=dataset_jsonl)
     corpus = _build_corpus(rows=rows, document_instruction=document_instruction)
     queries = _build_queries(rows=rows, query_instruction=query_instruction)
@@ -1176,7 +1180,7 @@ def evaluate(
         "eval/mrr": metrics.mrr,
     }
     log.info(f"{payload=}")
-    wandb.log(payload)
+    _log_scalars_to_wandb_summary(payload)
     wandb.finish()
     return payload
 
@@ -1220,10 +1224,16 @@ def _vllm_openai_models_probe_url(vllm_base_url: str) -> str:
     return f"{vllm_base_url.rstrip('/')}/models"
 
 
+def _is_port_in_use(port: int) -> bool:
+    """Returns True when a process is already bound to the TCP port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
 def _probe_vllm_http_ready(
     probe_url: str, timeout_sec: float, api_key: str
 ) -> bool:
-    """Returns True when ``probe_url`` responds with HTTP 2xx."""
+    """Returns True when probe_url responds with HTTP 2xx."""
     request = Request(
         probe_url,
         headers={
@@ -1233,8 +1243,7 @@ def _probe_vllm_http_ready(
     )
     try:
         with urlopen(request, timeout=timeout_sec) as response:
-            code = response.getcode()
-            return 200 <= code < 300
+            return 200 <= response.getcode() < 300
     except (HTTPError, URLError, TimeoutError, OSError):
         return False
 
@@ -1288,6 +1297,12 @@ def _maybe_start_vllm_server(
     """Starts vLLM server in the background when requested."""
     if not start_vllm_server:
         return None
+
+    if _is_port_in_use(vllm_port):
+        raise RuntimeError(
+            f"Port {vllm_port} is already in use. "
+            "Stop the existing vLLM server before starting a new one."
+        )
 
     command = [
         "uv",
@@ -1516,18 +1531,24 @@ def _build_validation_output(
     return output
 
 
+def _log_scalars_to_wandb_summary(payload: dict[str, float]) -> None:
+    """Logs scalar metrics directly to W&B run summary for cross-run bar plots."""
+    wandb.run.summary.update(payload)
+    log.info(f"{payload=}")
+
+
 def evaluate_validation_parquet(
     validation_parquet: str = "artifacts/val.parquet",
     retrieval_model: str = "Qwen/Qwen3-Embedding-0.6B",
     force_reindex: bool = False,
     artifacts_root: str = "artifacts",
-    vllm_base_url: str = "http://127.0.0.1:8000/v1",
+    vllm_base_url: str = "",
     vllm_api_key: str = "EMPTY",
-    vllm_batch_size: int = 64,
-    vllm_max_concurrency: int = 8,
+    vllm_batch_size: int = 512,
+    vllm_max_concurrency: int = 32,
     start_vllm_server: bool = True,
     vllm_gpu_device: int = 3,
-    vllm_port: int = 8000,
+    vllm_port: int = 8002,
     vllm_gpu_memory_utilization: float = 0.9,
     wandb_project: str = "ast-skills-retriever",
     wandb_entity: str = "",
@@ -1542,6 +1563,8 @@ def evaluate_validation_parquet(
     Runs the given retrieval_model (vLLM or HuggingFace) across both
     retrieval fields (summary and description). BM25 is optional.
     """
+    if not vllm_base_url:
+        vllm_base_url = f"http://127.0.0.1:{vllm_port}/v1"
     vllm_process = _maybe_start_vllm_server(
         model_name=retrieval_model,
         vllm_port=vllm_port,
@@ -1647,7 +1670,7 @@ def evaluate_validation_parquet(
             vllm_process.terminate()
             log.info(f"{vllm_process.pid=}, stopped=True")
 
-    wandb.log(_build_validation_payload(metrics_by_field))
+    _log_scalars_to_wandb_summary(_build_validation_payload(metrics_by_field))
     table_rows = []
     for field_key, metrics_by_model in metrics_by_field.items():
         for model_key, metrics in metrics_by_model.items():
@@ -1735,7 +1758,7 @@ def evaluate_validation_bm25_parquet(
         )
         metrics_by_field[field_key] = {"bm25": bm25_metrics}
 
-    wandb.log(_build_validation_payload(metrics_by_field))
+    _log_scalars_to_wandb_summary(_build_validation_payload(metrics_by_field))
     table_rows = []
     for field_key, metrics_by_model in metrics_by_field.items():
         for model_key, metrics in metrics_by_model.items():
@@ -1776,17 +1799,19 @@ def build_validation_indexes(
     retrieval_model: str = "Qwen/Qwen3-Embedding-0.6B",
     force_reindex: bool = False,
     artifacts_root: str = "artifacts",
-    vllm_base_url: str = "http://127.0.0.1:8000/v1",
+    vllm_base_url: str = "",
     vllm_api_key: str = "EMPTY",
-    vllm_batch_size: int = 64,
-    vllm_max_concurrency: int = 8,
+    vllm_batch_size: int = 512,
+    vllm_max_concurrency: int = 32,
     start_vllm_server: bool = True,
     vllm_gpu_device: int = 3,
-    vllm_port: int = 8000,
+    vllm_port: int = 8002,
     vllm_gpu_memory_utilization: float = 0.9,
     use_hf_encoder: bool = False,
 ) -> dict[str, dict[str, int]]:
     """Builds and caches Chroma and BM25 artifacts for validation retrieval."""
+    if not vllm_base_url:
+        vllm_base_url = f"http://127.0.0.1:{vllm_port}/v1"
     validation_payload = _load_validation_payload(validation_parquet=validation_parquet)
     output: dict[str, dict[str, int]] = {}
     all_cached = _all_chroma_collections_cached(
@@ -1870,7 +1895,8 @@ async def evaluate_validated_skill_questions_async(
     output_validation_parquet: str = "artifacts/retriever_training/validation.parquet",
     train_questions_per_skill: int = 2,
     validation_questions_per_skill: int = 1,
-    vllm_base_url: str = "http://127.0.0.1:8000/v1",
+    vllm_port: int = 8002,
+    vllm_base_url: str = "",
     vllm_api_key: str = "EMPTY",
     vllm_embedding_model: str = "Qwen/Qwen3-Embedding-0.6B",
     vllm_batch_size: int = 64,
@@ -1881,6 +1907,8 @@ async def evaluate_validated_skill_questions_async(
     sentence_batch_size: int = 64,
 ) -> dict[str, Any]:
     """Runs MMR question selection, parquet creation, and validation evaluation."""
+    if not vllm_base_url:
+        vllm_base_url = f"http://127.0.0.1:{vllm_port}/v1"
     total_selected_questions = (
         train_questions_per_skill + validation_questions_per_skill
     )
@@ -1942,7 +1970,8 @@ def evaluate_validated_skill_questions(
     output_validation_parquet: str = "artifacts/retriever_training/validation.parquet",
     train_questions_per_skill: int = 2,
     validation_questions_per_skill: int = 1,
-    vllm_base_url: str = "http://127.0.0.1:8000/v1",
+    vllm_port: int = 8002,
+    vllm_base_url: str = "",
     vllm_api_key: str = "EMPTY",
     vllm_embedding_model: str = "Qwen/Qwen3-Embedding-0.6B",
     vllm_batch_size: int = 64,
@@ -1960,6 +1989,7 @@ def evaluate_validated_skill_questions(
             output_validation_parquet=output_validation_parquet,
             train_questions_per_skill=train_questions_per_skill,
             validation_questions_per_skill=validation_questions_per_skill,
+            vllm_port=vllm_port,
             vllm_base_url=vllm_base_url,
             vllm_api_key=vllm_api_key,
             vllm_embedding_model=vllm_embedding_model,

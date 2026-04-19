@@ -122,13 +122,13 @@ def run_model_sweep(
     artifacts_root: str = "artifacts",
     mode: str = "smoke",
     force_reindex: bool = False,
-    vllm_base_url: str = "http://127.0.0.1:8000/v1",
+    vllm_base_url: str = "",
     vllm_api_key: str = "EMPTY",
-    vllm_batch_size: int = 64,
-    vllm_max_concurrency: int = 8,
+    vllm_batch_size: int = 512,
+    vllm_max_concurrency: int = 32,
     start_vllm_server: bool = True,
     vllm_gpu_device: int = 3,
-    vllm_port: int = 8000,
+    vllm_port: int = 8002,
     vllm_gpu_memory_utilization: float = 0.9,
     wandb_project: str = "ast-skills-retriever",
     wandb_entity: str = "",
@@ -143,6 +143,8 @@ def run_model_sweep(
       - If indexes already exist and force_reindex is False, index build is skipped.
       - BM25 is intentionally excluded from this flow.
     """
+    if not vllm_base_url:
+        vllm_base_url = f"http://127.0.0.1:{vllm_port}/v1"
     _validation_parquet_exists(validation_parquet=validation_parquet)
     selected_model = _resolve_retrieval_model(
         retrieval_model=retrieval_model,

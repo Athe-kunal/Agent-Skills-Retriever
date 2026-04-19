@@ -28,8 +28,12 @@ EVAL_VAL_PARQUET ?= artifacts/val.parquet
 EVAL_FORCE_REINDEX ?= false
 EVAL_START_VLLM ?= true
 EVAL_VLLM_GPU ?= 3
+EVAL_VLLM_PORT ?= 8002
+EVAL_VLLM_BASE_URL ?= http://127.0.0.1:$(EVAL_VLLM_PORT)/v1
+EVAL_VLLM_BATCH_SIZE ?= 512
+EVAL_VLLM_MAX_CONCURRENCY ?= 32
 EVAL_MAX_VAL_ROWS ?= 0
-EVAL_MODE ?= smoke
+EVAL_MODE ?= full
 EVAL_MODELS ?=
 
 .PHONY: vllm-embd-serve
@@ -108,6 +112,10 @@ retriever-evaluate-validation:
 		--force_reindex $(EVAL_FORCE_REINDEX) \
 		--start_vllm_server $(EVAL_START_VLLM) \
 		--vllm_gpu_device $(EVAL_VLLM_GPU) \
+		--vllm_port $(EVAL_VLLM_PORT) \
+		--vllm_base_url $(EVAL_VLLM_BASE_URL) \
+		--vllm_batch_size $(EVAL_VLLM_BATCH_SIZE) \
+		--vllm_max_concurrency $(EVAL_VLLM_MAX_CONCURRENCY) \
 		--max_validation_rows $(EVAL_MAX_VAL_ROWS)
 
 .PHONY: smoke-test
@@ -122,4 +130,8 @@ retriever-evaluate-model-sweep:
 		--force_reindex $(EVAL_FORCE_REINDEX) \
 		--start_vllm_server $(EVAL_START_VLLM) \
 		--vllm_gpu_device $(EVAL_VLLM_GPU) \
+		--vllm_port $(EVAL_VLLM_PORT) \
+		--vllm_base_url $(EVAL_VLLM_BASE_URL) \
+		--vllm_batch_size $(EVAL_VLLM_BATCH_SIZE) \
+		--vllm_max_concurrency $(EVAL_VLLM_MAX_CONCURRENCY) \
 		--models "$(EVAL_MODELS)"
