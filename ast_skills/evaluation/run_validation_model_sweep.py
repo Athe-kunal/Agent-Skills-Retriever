@@ -148,7 +148,7 @@ def run_model_sweep(
     Notes:
       - Runs one embedding model per invocation.
       - If indexes already exist and force_reindex is False, index build is skipped.
-      - BM25 is intentionally excluded from this flow.
+      - Dense runs report both dense and hybrid (dense + BM25 RRF) metrics.
     """
     if not vllm_base_url:
         vllm_base_url = f"http://127.0.0.1:{vllm_port}/v1"
@@ -210,7 +210,6 @@ def run_model_sweep(
             wandb_entity=config.wandb_entity,
             run_name=run_name,
             max_validation_rows=max_validation_rows,
-            include_bm25=False,
         )
         if all_indexes_exist and not config.force_reindex:
             index_output = _index_output_for_cached_indexes(config=config)

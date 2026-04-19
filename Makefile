@@ -35,6 +35,11 @@ EVAL_VLLM_MAX_CONCURRENCY ?= 32
 EVAL_MAX_VAL_ROWS ?= 0
 EVAL_MODE ?= full
 EVAL_MODELS ?=
+EVAL_WANDB_PROJECT ?= ast-skills-retriever
+EVAL_WANDB_ENTITY ?=
+EVAL_RUN_NAME ?= validation-parquet-eval
+EVAL_USE_HF_ENCODER ?= false
+EVAL_DENSE_MODELS ?= Qwen/Qwen3-Embedding-0.6B,Qwen/Qwen3-Embedding-4B,Qwen/Qwen3-Embedding-8B,vespa-engine/colbert,sentence-transformers/bert-large-nli-mean-tokens
 
 .PHONY: vllm-embd-serve
 vllm-embd-serve:
@@ -116,6 +121,20 @@ retriever-evaluate-validation:
 		--vllm_base_url $(EVAL_VLLM_BASE_URL) \
 		--vllm_batch_size $(EVAL_VLLM_BATCH_SIZE) \
 		--vllm_max_concurrency $(EVAL_VLLM_MAX_CONCURRENCY) \
+		--wandb_project $(EVAL_WANDB_PROJECT) \
+		--wandb_entity $(EVAL_WANDB_ENTITY) \
+		--run_name $(EVAL_RUN_NAME) \
+		--use_hf_encoder $(EVAL_USE_HF_ENCODER) \
+		--max_validation_rows $(EVAL_MAX_VAL_ROWS)
+
+.PHONY: retriever-evaluate-validation-bm25
+retriever-evaluate-validation-bm25:
+	uv run python -m ast_skills.evaluation.evaluate_retriever evaluate_validation_bm25_parquet \
+		--validation_parquet $(EVAL_VAL_PARQUET) \
+		--force_reindex $(EVAL_FORCE_REINDEX) \
+		--wandb_project $(EVAL_WANDB_PROJECT) \
+		--wandb_entity $(EVAL_WANDB_ENTITY) \
+		--run_name $(EVAL_RUN_NAME)-bm25 \
 		--max_validation_rows $(EVAL_MAX_VAL_ROWS)
 
 .PHONY: smoke-test
@@ -135,3 +154,11 @@ retriever-evaluate-model-sweep:
 		--vllm_batch_size $(EVAL_VLLM_BATCH_SIZE) \
 		--vllm_max_concurrency $(EVAL_VLLM_MAX_CONCURRENCY) \
 		--models "$(EVAL_MODELS)"
+
+.PHONY: retriever-evaluate-two-gpu
+retriever-evaluate-two-gpu:
+	bash scripts/run_validation_two_gpu.sh \
+		"$(EVAL_DENSE_MODELS)" \
+		"$(EVAL_VAL_PARQUET)" \
+		"$(EVAL_WANDB_PROJECT)" \
+		"$(EVAL_WANDB_ENTITY)"
