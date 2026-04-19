@@ -20,7 +20,7 @@ import socket
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, NamedTuple, Sequence
+from typing import TYPE_CHECKING, Any, NamedTuple, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -34,9 +34,11 @@ import yaml
 from loguru import logger as log
 from openai import AsyncOpenAI
 from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
-from transformers import AutoModel, AutoTokenizer
+
+if TYPE_CHECKING:
+    from sentence_transformers import SentenceTransformer
+    from transformers import AutoModel, AutoTokenizer
 
 from ast_skills.data_gen.datamodels import TrainingData
 from ast_skills.train.datamodels import DataPoint
@@ -145,6 +147,30 @@ class _BM25CachePayload(NamedTuple):
 
     texts: list[str]
     names: list[str]
+
+
+def _require_sentence_transformers() -> Any:
+    """Loads ``sentence_transformers`` lazily for optional dependency support."""
+    try:
+        from sentence_transformers import SentenceTransformer  # type: ignore
+    except ImportError as error:
+        raise ImportError(
+            "sentence-transformers is required only for retrieval_backend='bi_encoder'. "
+            "Install it or switch to retrieval_backend='vllm'."
+        ) from error
+    return SentenceTransformer
+
+
+def _require_hf_transformers() -> tuple[Any, Any]:
+    """Loads Hugging Face classes lazily for optional dependency support."""
+    try:
+        from transformers import AutoModel, AutoTokenizer  # type: ignore
+    except ImportError as error:
+        raise ImportError(
+            "transformers is required only when use_hf_encoder=True or "
+            "retrieval_backend='late_interaction'."
+        ) from error
+    return AutoModel, AutoTokenizer
 
 
 def _read_jsonl(path: Path) -> list[dict]:
@@ -520,8 +546,9 @@ def _encode_sentence_embeddings(
 
 def _load_hf_encoder(model_name: str) -> _HfEncoderAssets:
     """Loads tokenizer and model for Hugging Face encoder inference."""
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+    auto_model_cls, auto_tokenizer_cls = _require_hf_transformers()
+    tokenizer = auto_tokenizer_cls.from_pretrained(model_name, trust_remote_code=True)
+    model = auto_model_cls.from_pretrained(model_name, trust_remote_code=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     model.eval()
@@ -1121,23 +1148,15 @@ def evaluate(
         config=wandb_config,
     )
 
-    use_hf_sentence_backend = "bert" in retrieval_model.casefold()
     if retrieval_backend == "bi_encoder":
-        if use_hf_sentence_backend:
-            encoded_queries, encoded_corpus = _encode_hf_sentence_backend(
-                model_name=retrieval_model,
-                query_texts=queries.texts,
-                doc_texts=corpus.texts,
-                sentence_batch_size=sentence_batch_size,
-            )
-        else:
-            model = SentenceTransformer(retrieval_model)
-            encoded_queries, encoded_corpus = _encode_sentence_backend(
-                model=model,
-                query_texts=queries.texts,
-                doc_texts=corpus.texts,
-                sentence_batch_size=sentence_batch_size,
-            )
+        sentence_transformer_cls = _require_sentence_transformers()
+        model = sentence_transformer_cls(retrieval_model)
+        encoded_queries, encoded_corpus = _encode_sentence_backend(
+            model=model,
+            query_texts=queries.texts,
+            doc_texts=corpus.texts,
+            sentence_batch_size=sentence_batch_size,
+        )
     elif retrieval_backend == "late_interaction":
         encoded_queries, encoded_corpus = _encode_late_interaction_backend(
             model_name=retrieval_model,

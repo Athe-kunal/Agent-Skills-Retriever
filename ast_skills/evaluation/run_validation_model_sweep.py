@@ -9,7 +9,6 @@ import fire
 from loguru import logger as log
 
 from ast_skills.evaluation.evaluate_retriever import (
-    build_validation_indexes,
     evaluate_validation_bm25_parquet,
     evaluate_validation_parquet,
     get_validation_index_status,
@@ -24,6 +23,7 @@ class _SingleEvaluationConfig(NamedTuple):
     retrieval_model: str
     mode: str
     force_reindex: bool
+    use_hf_encoder: bool
     vllm_base_url: str
     vllm_api_key: str
     vllm_batch_size: int
@@ -85,26 +85,32 @@ def _indexes_exist_for_all_fields(config: _SingleEvaluationConfig) -> bool:
     return all_indexes_exist
 
 
-def _build_indexes_if_missing(config: _SingleEvaluationConfig) -> dict[str, Any]:
-    """Builds validation indexes only when missing."""
-    if _indexes_exist_for_all_fields(config=config):
-        output = {"status": "skipped", "reason": "indexes_already_exist"}
-        log.info(f"{output=}")
-        return output
-    output = build_validation_indexes(
-        validation_parquet=config.validation_parquet,
-        retrieval_model=config.retrieval_model,
-        force_reindex=config.force_reindex,
+def _index_output_for_cached_indexes(config: _SingleEvaluationConfig) -> dict[str, Any]:
+    """Returns index metadata when all Chroma indexes already exist."""
+    index_status = get_validation_index_status(
         artifacts_root=config.artifacts_root,
-        vllm_base_url=config.vllm_base_url,
-        vllm_api_key=config.vllm_api_key,
-        vllm_batch_size=config.vllm_batch_size,
-        vllm_max_concurrency=config.vllm_max_concurrency,
-        start_vllm_server=config.start_vllm_server,
-        vllm_gpu_device=config.vllm_gpu_device,
-        vllm_port=config.vllm_port,
-        vllm_gpu_memory_utilization=config.vllm_gpu_memory_utilization,
+        retrieval_model=config.retrieval_model,
     )
+    output = {
+        "status": "skipped",
+        "reason": "indexes_already_exist",
+        "index_status": index_status,
+    }
+    log.info(f"{output=}")
+    return output
+
+
+def _index_output_for_evaluation_build(config: _SingleEvaluationConfig) -> dict[str, Any]:
+    """Returns index metadata when indexes are built during evaluation."""
+    index_status = get_validation_index_status(
+        artifacts_root=config.artifacts_root,
+        retrieval_model=config.retrieval_model,
+    )
+    output = {
+        "status": "built_in_evaluate",
+        "reason": "single_vllm_lifecycle",
+        "index_status": index_status,
+    }
     log.info(f"{output=}")
     return output
 
@@ -122,6 +128,7 @@ def run_model_sweep(
     artifacts_root: str = "artifacts",
     mode: str = "smoke",
     force_reindex: bool = False,
+    use_hf_encoder: bool = False,
     vllm_base_url: str = "",
     vllm_api_key: str = "EMPTY",
     vllm_batch_size: int = 512,
@@ -156,6 +163,7 @@ def run_model_sweep(
         retrieval_model=selected_model,
         mode=mode,
         force_reindex=force_reindex,
+        use_hf_encoder=use_hf_encoder,
         vllm_base_url=vllm_base_url,
         vllm_api_key=vllm_api_key,
         vllm_batch_size=vllm_batch_size,
@@ -183,11 +191,12 @@ def run_model_sweep(
             max_validation_rows=max_validation_rows,
         )
     else:
-        index_output = _build_indexes_if_missing(config=config)
+        all_indexes_exist = _indexes_exist_for_all_fields(config=config)
         evaluation_output = evaluate_validation_parquet(
             validation_parquet=config.validation_parquet,
             retrieval_model=config.retrieval_model,
-            force_reindex=False,
+            force_reindex=config.force_reindex,
+            use_hf_encoder=config.use_hf_encoder,
             artifacts_root=config.artifacts_root,
             vllm_base_url=config.vllm_base_url,
             vllm_api_key=config.vllm_api_key,
@@ -203,6 +212,10 @@ def run_model_sweep(
             max_validation_rows=max_validation_rows,
             include_bm25=False,
         )
+        if all_indexes_exist and not config.force_reindex:
+            index_output = _index_output_for_cached_indexes(config=config)
+        else:
+            index_output = _index_output_for_evaluation_build(config=config)
     output = {
         config.retrieval_model: {
             "index_output": index_output,
