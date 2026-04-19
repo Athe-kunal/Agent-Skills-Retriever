@@ -11,6 +11,7 @@ for instruction-tuned embedding models.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import asyncio
 import os
@@ -20,6 +21,8 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any, NamedTuple, Sequence
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import chromadb
 import fire
@@ -32,9 +35,11 @@ from loguru import logger as log
 from openai import AsyncOpenAI
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
+from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 
 from ast_skills.data_gen.datamodels import TrainingData
+from ast_skills.train.datamodels import DataPoint
 from ast_skills.retriever.datamodels import (
     SummaryRetrieverDataModel,
     ValidatedSkillQuestionRow,
@@ -73,7 +78,7 @@ class _QueryPayload(NamedTuple):
 class _ValidationPayload(NamedTuple):
     """Loaded validation rows plus query labels."""
 
-    rows: list[TrainingData]
+    rows: list[DataPoint]
     query_texts: list[str]
     expected_names: list[str]
 
@@ -198,14 +203,33 @@ VALIDATION_FIELD_CONFIGS: tuple[_ValidationFieldConfig, ...] = (
     _ValidationFieldConfig(field_key="description"),
 )
 
+_VLLM_STARTUP_POLL_INTERVAL_SEC = 2.0
+_VLLM_STARTUP_TIMEOUT_SEC = 600.0
+_VLLM_STARTUP_PROBE_TIMEOUT_SEC = 5.0
+_CHROMA_ADD_BATCH_SIZE = 5000
+
+
+def _data_point_from_parquet_record(record: dict[str, Any]) -> DataPoint:
+    """Builds a ``DataPoint`` from a Parquet row dict, ignoring unknown columns."""
+    kwargs: dict[str, str] = {}
+    for field in dataclasses.fields(DataPoint):
+        raw = record.get(field.name)
+        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+            kwargs[field.name] = ""
+        elif isinstance(raw, str):
+            kwargs[field.name] = raw
+        else:
+            kwargs[field.name] = str(raw)
+    return DataPoint(**kwargs)
+
 
 def _load_validation_payload(validation_parquet: str) -> _ValidationPayload:
-    """Loads ``TrainingData`` rows from validation parquet."""
+    """Loads ``DataPoint`` rows from validation parquet."""
     validation_path = Path(validation_parquet)
     dataframe = pd.read_parquet(validation_path)
-    rows: list[TrainingData] = []
+    rows: list[DataPoint] = []
     for record in dataframe.to_dict(orient="records"):
-        rows.append(TrainingData(**record))
+        rows.append(_data_point_from_parquet_record(record))
 
     query_texts = [row.question.strip() for row in rows if row.question.strip()]
     expected_names = [row.name.strip() for row in rows if row.question.strip()]
@@ -367,7 +391,7 @@ def _build_split_result_payload(
     return payload
 
 
-def _text_for_field(row: TrainingData, field_key: str) -> str:
+def _text_for_field(row: DataPoint, field_key: str) -> str:
     """Returns text for ``summary`` or ``description`` field retrieval."""
     if field_key == "summary":
         return row.summary.strip()
@@ -377,24 +401,35 @@ def _text_for_field(row: TrainingData, field_key: str) -> str:
 
 
 def _build_validation_corpus(
-    rows: Sequence[TrainingData],
+    rows: Sequence[DataPoint],
     field_key: str,
 ) -> _CorpusPayload:
     """Builds unique corpus for one retrieval field."""
     text_by_name: dict[str, str] = {}
+    empty_name_skips = 0
+    duplicate_name_skips = 0
+    empty_field_skips = 0
     for row in rows:
         name = row.name.strip()
-        if not name or name in text_by_name:
+        if not name:
+            empty_name_skips += 1
+            continue
+        if name in text_by_name:
+            duplicate_name_skips += 1
             continue
         text = _text_for_field(row=row, field_key=field_key)
         if not text:
+            empty_field_skips += 1
             continue
         text_by_name[name] = text
 
     names = list(text_by_name.keys())
     texts = [text_by_name[name] for name in names]
     payload = _CorpusPayload(texts=texts, names=names)
-    log.info(f"{field_key=}, {len(names)=}, {len(texts)=}")
+    log.info(
+        f"{field_key=}, parquet_rows={len(rows)}, unique_corpus_docs={len(texts)}, "
+        f"{empty_name_skips=}, {duplicate_name_skips=}, {empty_field_skips=}"
+    )
     return payload
 
 
@@ -431,11 +466,12 @@ def _sanitize_model_name(model_name: str) -> str:
     return sanitized_model_name or "model"
 
 
-def _build_collection_name(field_key: str, model_name: str) -> str:
-    """Builds Chroma collection name from field and model."""
-    sanitized_model_name = _sanitize_model_name(model_name=model_name)
+def _build_collection_name(
+    field_key: str, *, sanitized_model_name: str
+) -> str:
+    """Builds Chroma collection name: field key plus sanitized embedding model id."""
     collection_name = f"{field_key}_{sanitized_model_name}"
-    log.info(f"{field_key=}, {collection_name=}")
+    log.info(f"{field_key=}, {sanitized_model_name=}, {collection_name=}")
     return collection_name
 
 
@@ -615,26 +651,56 @@ async def _fetch_embeddings_chunk(
     return text_chunk.start_index, embeddings
 
 
+async def _fetch_embeddings_chunk_with_progress(
+    client: AsyncOpenAI,
+    embedding_model: str,
+    text_chunk: _TextChunk,
+    semaphore: asyncio.Semaphore,
+    progress_bar: tqdm,
+) -> tuple[int, list[list[float]]]:
+    """Requests one embeddings chunk and advances the tqdm bar by texts completed."""
+    start_index, vectors = await _fetch_embeddings_chunk(
+        client=client,
+        embedding_model=embedding_model,
+        text_chunk=text_chunk,
+        semaphore=semaphore,
+    )
+    progress_bar.update(len(text_chunk.texts))
+    return start_index, vectors
+
+
 async def _encode_vllm_async(
     client: AsyncOpenAI,
     embedding_model: str,
     texts: Sequence[str],
     batch_size: int,
     max_concurrency: int,
+    progress_desc: str = "vLLM embeddings",
+    progress_position: int | None = None,
 ) -> np.ndarray:
     """Encodes embeddings with async OpenAI-compatible API and concurrency limits."""
     chunks = _chunk_texts(texts=texts, batch_size=batch_size)
     semaphore = asyncio.Semaphore(max_concurrency)
-    tasks = [
-        _fetch_embeddings_chunk(
-            client=client,
-            embedding_model=embedding_model,
-            text_chunk=text_chunk,
-            semaphore=semaphore,
-        )
-        for text_chunk in chunks
-    ]
-    chunk_results = await asyncio.gather(*tasks)
+    tqdm_kwargs: dict[str, Any] = {
+        "total": len(texts),
+        "desc": progress_desc,
+        "unit": "text",
+        "mininterval": 0.5,
+    }
+    if progress_position is not None:
+        tqdm_kwargs["position"] = progress_position
+    with tqdm(**tqdm_kwargs) as progress_bar:
+        tasks = [
+            _fetch_embeddings_chunk_with_progress(
+                client=client,
+                embedding_model=embedding_model,
+                text_chunk=text_chunk,
+                semaphore=semaphore,
+                progress_bar=progress_bar,
+            )
+            for text_chunk in chunks
+        ]
+        chunk_results = await asyncio.gather(*tasks)
     ordered_results = sorted(chunk_results, key=lambda item: item[0])
     vectors: list[list[float]] = []
     for _, chunk_vectors in ordered_results:
@@ -661,6 +727,8 @@ async def _encode_vllm_pair_async(
         texts=query_texts,
         batch_size=batch_size,
         max_concurrency=max_concurrency,
+        progress_desc="vLLM query embeddings",
+        progress_position=0,
     )
     encoded_docs_task = _encode_vllm_async(
         client=client,
@@ -668,6 +736,8 @@ async def _encode_vllm_pair_async(
         texts=doc_texts,
         batch_size=batch_size,
         max_concurrency=max_concurrency,
+        progress_desc="vLLM document embeddings",
+        progress_position=1,
     )
     query_embeddings, doc_embeddings = await asyncio.gather(
         encoded_queries_task,
@@ -1135,12 +1205,75 @@ def _build_validation_wandb_config(
     return config
 
 
+def _vllm_openai_models_probe_url(vllm_base_url: str) -> str:
+    """Returns the OpenAI-compatible models URL used to verify vLLM is up."""
+    return f"{vllm_base_url.rstrip('/')}/models"
+
+
+def _probe_vllm_http_ready(
+    probe_url: str, timeout_sec: float, api_key: str
+) -> bool:
+    """Returns True when ``probe_url`` responds with HTTP 2xx."""
+    request = Request(
+        probe_url,
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+    try:
+        with urlopen(request, timeout=timeout_sec) as response:
+            code = response.getcode()
+            return 200 <= code < 300
+    except (HTTPError, URLError, TimeoutError, OSError):
+        return False
+
+
+def _wait_for_vllm_server_ready(
+    process: subprocess.Popen[bytes],
+    vllm_base_url: str,
+    api_key: str,
+    poll_interval_sec: float,
+    timeout_sec: float,
+    probe_timeout_sec: float,
+) -> None:
+    """Blocks until the vLLM OpenAI endpoint answers or startup fails."""
+    deadline = time.monotonic() + timeout_sec
+    probe_url = _vllm_openai_models_probe_url(vllm_base_url=vllm_base_url)
+    log.info(
+        f"{probe_url=}, {poll_interval_sec=}, {timeout_sec=}, {probe_timeout_sec=}"
+    )
+    while time.monotonic() < deadline:
+        exit_code = process.poll()
+        if exit_code is not None:
+            raise RuntimeError(
+                "vLLM process exited before the endpoint became ready; "
+                f"{exit_code=}, {probe_url=}. Server stderr was not captured."
+            )
+        if _probe_vllm_http_ready(
+            probe_url=probe_url,
+            timeout_sec=probe_timeout_sec,
+            api_key=api_key,
+        ):
+            log.info(f"{probe_url=}, {process.pid=}, ready=True")
+            return
+        time.sleep(poll_interval_sec)
+    raise TimeoutError(
+        f"vLLM did not become ready within {timeout_sec}s; last probe was {probe_url=}."
+    )
+
+
 def _maybe_start_vllm_server(
     model_name: str,
     vllm_port: int,
     vllm_gpu_device: int,
     vllm_gpu_memory_utilization: float,
     start_vllm_server: bool,
+    vllm_base_url: str,
+    vllm_api_key: str,
+    startup_timeout_sec: float = _VLLM_STARTUP_TIMEOUT_SEC,
+    poll_interval_sec: float = _VLLM_STARTUP_POLL_INTERVAL_SEC,
+    probe_timeout_sec: float = _VLLM_STARTUP_PROBE_TIMEOUT_SEC,
 ) -> subprocess.Popen[bytes] | None:
     """Starts vLLM server in the background when requested."""
     if not start_vllm_server:
@@ -1172,7 +1305,14 @@ def _maybe_start_vllm_server(
         stderr=subprocess.DEVNULL,
     )
     log.info(f"{command=}, {process.pid=}")
-    time.sleep(5)
+    _wait_for_vllm_server_ready(
+        process=process,
+        vllm_base_url=vllm_base_url,
+        api_key=vllm_api_key,
+        poll_interval_sec=poll_interval_sec,
+        timeout_sec=startup_timeout_sec,
+        probe_timeout_sec=probe_timeout_sec,
+    )
     return process
 
 
@@ -1188,13 +1328,19 @@ def _load_chroma_corpus_artifacts(
     vllm_max_concurrency: int,
 ) -> _ChromaCorpusArtifacts:
     """Loads cached corpus embeddings from Chroma or indexes them once."""
-    chroma_path = Path(artifacts_root) / "chroma_validation"
+    sanitized_model_name = _sanitize_model_name(model_name=model_name)
+    chroma_path = Path(artifacts_root) / "chroma_validation" / sanitized_model_name
     chroma_path.mkdir(parents=True, exist_ok=True)
     client = chromadb.PersistentClient(path=str(chroma_path))
-    collection_name = _build_collection_name(field_key=field_key, model_name=model_name)
+    collection_name = _build_collection_name(
+        field_key=field_key, sanitized_model_name=sanitized_model_name
+    )
     collection = client.get_or_create_collection(name=collection_name)
     current_count = collection.count()
-    log.info(f"{collection_name=}, {current_count=}, {force_reindex=}")
+    log.info(
+        f"{model_name=}, {chroma_path=}, {collection_name=}, "
+        f"{current_count=}, {force_reindex=}"
+    )
 
     if current_count > 0 and not force_reindex:
         existing = collection.get(include=["embeddings", "metadatas"], limit=current_count)
@@ -1215,16 +1361,24 @@ def _load_chroma_corpus_artifacts(
             texts=corpus.texts,
             batch_size=batch_size,
             max_concurrency=vllm_max_concurrency,
+            progress_desc=f"Chroma corpus embeddings ({field_key})",
         )
     )
     ids = [f"{field_key}_{index}" for index in range(len(corpus.texts))]
     metadatas = [{"name": name} for name in corpus.names]
-    collection.add(
-        ids=ids,
-        documents=corpus.texts,
-        embeddings=embeddings.tolist(),
-        metadatas=metadatas,
-    )
+    total_docs = len(ids)
+    for batch_start in range(0, total_docs, _CHROMA_ADD_BATCH_SIZE):
+        batch_end = min(batch_start + _CHROMA_ADD_BATCH_SIZE, total_docs)
+        log.info(
+            f"Chroma collection.add batch {batch_start}-{batch_end} of {total_docs}, "
+            f"{_CHROMA_ADD_BATCH_SIZE=}"
+        )
+        collection.add(
+            ids=ids[batch_start:batch_end],
+            documents=list(corpus.texts[batch_start:batch_end]),
+            embeddings=embeddings[batch_start:batch_end].tolist(),
+            metadatas=metadatas[batch_start:batch_end],
+        )
     return _ChromaCorpusArtifacts(embeddings=embeddings, names=corpus.names)
 
 
@@ -1289,6 +1443,8 @@ def evaluate_validation_parquet(
         vllm_gpu_device=vllm_gpu_device,
         vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
         start_vllm_server=start_vllm_server,
+        vllm_base_url=vllm_base_url,
+        vllm_api_key=vllm_api_key,
     )
     validation_payload = _load_validation_payload(validation_parquet=validation_parquet)
     validation_payload = _slice_validation_payload(
@@ -1339,6 +1495,7 @@ def evaluate_validation_parquet(
                     texts=validation_payload.query_texts,
                     batch_size=vllm_batch_size,
                     max_concurrency=vllm_max_concurrency,
+                    progress_desc="Validation query embeddings",
                 )
             )
             dense_score_matrix = _score_bi_encoder(
@@ -1429,6 +1586,8 @@ def build_validation_indexes(
         vllm_gpu_device=vllm_gpu_device,
         vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
         start_vllm_server=start_vllm_server,
+        vllm_base_url=vllm_base_url,
+        vllm_api_key=vllm_api_key,
     )
     validation_payload = _load_validation_payload(validation_parquet=validation_parquet)
     output: dict[str, dict[str, int]] = {}
