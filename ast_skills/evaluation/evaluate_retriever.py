@@ -215,7 +215,7 @@ def _read_validated_rows(input_jsonl: str) -> list[ValidatedSkillQuestionRow]:
                 num_from_scenario_questions=str(row["num_from_scenario_questions"]),
                 num_from_seed_questions=str(row["num_from_seed_questions"]),
                 reasoning=str(row["reasoning"]),
-                summary=str(row.get("summary", "")),
+                summary=str(row["summary"]),
             )
         )
     log.info(f"{input_jsonl=}, {len(rows)=}")
@@ -1133,7 +1133,7 @@ def evaluate_validated_skill_questions(
     vllm_max_concurrency: int = 8,
     wandb_project: str = "ast-skills-retriever",
     wandb_entity: str = "",
-    run_name: str = "validated-questions-parquet-eval",
+    run_name: str = "validated-eval",
     sentence_batch_size: int = 64,
 ) -> dict[str, Any]:
     """Sync CLI wrapper for async validated-question evaluation workflow."""

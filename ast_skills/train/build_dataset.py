@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import random
 from pathlib import Path
 
 import pandas as pd
@@ -12,6 +13,7 @@ from ast_skills.retriever.maximal_marginal_relevance_question import (
     MmrSelectionConfig,
     select_diverse_questions_for_rows,
 )
+from ast_skills.train.datamodels import DataPoint
 
 
 def _load_rows(path: str = "artifacts/validated_training_data_list.jsonl") -> list[ValidatedSkillQuestionRow]:
@@ -23,33 +25,47 @@ def _load_rows(path: str = "artifacts/validated_training_data_list.jsonl") -> li
     return rows
 
 
-def _rows_to_dataframe(rows: list[ValidatedSkillQuestionRow]) -> pd.DataFrame:
-    return pd.DataFrame([dataclasses.asdict(row) for row in rows])
+def _datapoints_to_dataframe(points: list[DataPoint]) -> pd.DataFrame:
+    return pd.DataFrame([dataclasses.asdict(p) for p in points])
+
+
+def _row_to_datapoint(row: ValidatedSkillQuestionRow, question: str) -> DataPoint:
+    return DataPoint(
+        name=row.name,
+        markdown_content=row.markdown_content,
+        summary=row.summary,
+        description=row.description,
+        question=question,
+    )
 
 
 async def build_train_val_parquets(
     config: MmrSelectionConfig,
     input_path: str = "artifacts/validated_training_data_list.jsonl",
     output_dir: str = "artifacts",
+    random_seed: int | None = None,
 ) -> None:
     rows = _load_rows(input_path)
     mmr_config = config._replace(selected_question_count=3)
     diverse_by_id = await select_diverse_questions_for_rows(rows=rows, config=mmr_config)
 
-    train_rows: list[ValidatedSkillQuestionRow] = []
-    val_rows: list[ValidatedSkillQuestionRow] = []
+    rng = random.Random(random_seed) if random_seed is not None else random.Random()
+    train_points: list[DataPoint] = []
+    val_points: list[DataPoint] = []
 
     for row in rows:
         mmr_questions = diverse_by_id.get(row.custom_id, [])
         if len(mmr_questions) < 3:
             continue
-        row_with_mmr = dataclasses.replace(row, mmr_questions=mmr_questions)
-        train_rows.append(dataclasses.replace(row_with_mmr, filtered_questions=mmr_questions[:2]))
-        val_rows.append(dataclasses.replace(row_with_mmr, filtered_questions=mmr_questions[2:3]))
+        shuffled = list(mmr_questions)
+        rng.shuffle(shuffled)
+        train_qs, val_q = shuffled[:2], shuffled[2]
+        train_points.extend(_row_to_datapoint(row, q) for q in train_qs)
+        val_points.append(_row_to_datapoint(row, val_q))
 
     output = Path(output_dir)
-    _rows_to_dataframe(train_rows).to_parquet(output / "train.parquet", index=False)
-    _rows_to_dataframe(val_rows).to_parquet(output / "val.parquet", index=False)
+    _datapoints_to_dataframe(train_points).to_parquet(output / "train.parquet", index=False)
+    _datapoints_to_dataframe(val_points).to_parquet(output / "val.parquet", index=False)
 
 
 def _main(
@@ -61,6 +77,7 @@ def _main(
     max_concurrency: int = 32,
     input_path: str = "artifacts/validated_training_data_list.jsonl",
     output_dir: str = "artifacts",
+    random_seed: int | None = None,
 ) -> None:
     config = MmrSelectionConfig(
         base_url=base_url,
@@ -71,7 +88,14 @@ def _main(
         batch_size=batch_size,
         max_concurrency=max_concurrency,
     )
-    asyncio.run(build_train_val_parquets(config=config, input_path=input_path, output_dir=output_dir))
+    asyncio.run(
+        build_train_val_parquets(
+            config=config,
+            input_path=input_path,
+            output_dir=output_dir,
+            random_seed=random_seed,
+        )
+    )
 
 
 if __name__ == "__main__":

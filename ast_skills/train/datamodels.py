@@ -19,23 +19,14 @@ class ModelOutput(pydantic.BaseModel):
 
 
 @dataclass(frozen=True)
-class TrainingData:
+class DataPoint:
     """One training/evaluation row used by retriever fine-tuning."""
 
     name: str
     markdown_content: str
     summary: str
     description: str
-    scenario_training_data: list[ScenarioTrainingData]
-    seed_questions_training_data: list[SeedQuestionsTrainingData]
-
-@dataclass()
-class ScenarioTrainingData:
     question: str
-    in_batch_negatives_question_wrt_descriptions: list[str]
-    in_batch_negatives_question_wrt_summaries: list[str]
-    in_batch_negatives_question_wrt_scenarios: list[str]
-    scenario: str
 
 
 @dataclass()
@@ -54,3 +45,4 @@ class ValidatedTrainingData:
     filtered_questions: list[str]
     num_from_seed_questions: str
     num_from_scenario_questions: str
+
