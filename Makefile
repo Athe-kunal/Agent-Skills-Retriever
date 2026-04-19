@@ -23,7 +23,13 @@ MMR_BATCH_SIZE ?= 64
 MMR_MAX_CONCURRENCY ?= 32
 
 TRAIN_CONFIG_PATH ?= configs/train.yaml
-EVAL_CONFIG_PATH ?= configs/train.yaml
+EVAL_MODEL ?= Qwen/Qwen3-Embedding-0.6B
+EVAL_VAL_PARQUET ?= artifacts/val.parquet
+EVAL_FORCE_REINDEX ?= false
+EVAL_START_VLLM ?= true
+EVAL_VLLM_GPU ?= 3
+EVAL_MAX_VAL_ROWS ?= 0
+EVAL_MODE ?= smoke
 
 .PHONY: vllm-embd-serve
 vllm-embd-serve:
@@ -90,5 +96,28 @@ retriever-train:
 
 .PHONY: retriever-evaluate
 retriever-evaluate:
-	uv run python -m ast_skills.retriever.evaluate_retriever evaluate_from_config \
-		--config_path $(EVAL_CONFIG_PATH)
+	uv run python -m ast_skills.evaluation.evaluate_retriever evaluate_from_config \
+		--config_path configs/train.yaml
+
+.PHONY: retriever-evaluate-validation
+retriever-evaluate-validation:
+	uv run python -m ast_skills.evaluation.evaluate_retriever evaluate_validation_parquet \
+		--validation_parquet $(EVAL_VAL_PARQUET) \
+		--retrieval_model $(EVAL_MODEL) \
+		--force_reindex $(EVAL_FORCE_REINDEX) \
+		--start_vllm_server $(EVAL_START_VLLM) \
+		--vllm_gpu_device $(EVAL_VLLM_GPU) \
+		--max_validation_rows $(EVAL_MAX_VAL_ROWS)
+
+.PHONY: smoke-test
+smoke-test:
+	$(MAKE) retriever-evaluate-validation EVAL_MAX_VAL_ROWS=5
+
+.PHONY: retriever-evaluate-model-sweep
+retriever-evaluate-model-sweep:
+	uv run python -m ast_skills.evaluation.run_validation_model_sweep run_model_sweep \
+		--validation_parquet $(EVAL_VAL_PARQUET) \
+		--mode $(EVAL_MODE) \
+		--force_reindex $(EVAL_FORCE_REINDEX) \
+		--start_vllm_server $(EVAL_START_VLLM) \
+		--vllm_gpu_device $(EVAL_VLLM_GPU)

@@ -13,19 +13,26 @@ from __future__ import annotations
 
 import json
 import asyncio
+import os
 import random
+import re
+import subprocess
+import time
 from pathlib import Path
 from typing import Any, NamedTuple, Sequence
 
+import chromadb
 import fire
 import numpy as np
 import pandas as pd
+import torch
 import wandb
 import yaml
 from loguru import logger as log
 from openai import AsyncOpenAI
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
+from transformers import AutoModel, AutoTokenizer
 
 from ast_skills.data_gen.datamodels import TrainingData
 from ast_skills.retriever.datamodels import (
@@ -113,6 +120,21 @@ class _EncodedQueries(NamedTuple):
     token_embeddings: list[np.ndarray] | None
 
 
+class _HfEncoderAssets(NamedTuple):
+    """Tokenizer and model used for Hugging Face embedding inference."""
+
+    tokenizer: AutoTokenizer
+    model: AutoModel
+    device: str
+
+
+class _ChromaCorpusArtifacts(NamedTuple):
+    """Stored document embeddings and names loaded from Chroma."""
+
+    embeddings: np.ndarray
+    names: list[str]
+
+
 def _read_jsonl(path: Path) -> list[dict]:
     """Reads JSONL records from ``path``."""
     rows: list[dict] = []
@@ -194,6 +216,26 @@ def _load_validation_payload(validation_parquet: str) -> _ValidationPayload:
     )
     log.info(f"{validation_path=}, {len(rows)=}, {len(query_texts)=}")
     return payload
+
+
+def _slice_validation_payload(
+    payload: _ValidationPayload,
+    max_validation_rows: int,
+) -> _ValidationPayload:
+    """Slices validation payload to at most ``max_validation_rows`` rows."""
+    if max_validation_rows <= 0:
+        return payload
+
+    sliced_rows = payload.rows[:max_validation_rows]
+    query_texts = [row.question.strip() for row in sliced_rows if row.question.strip()]
+    expected_names = [row.name.strip() for row in sliced_rows if row.question.strip()]
+    sliced_payload = _ValidationPayload(
+        rows=sliced_rows,
+        query_texts=query_texts,
+        expected_names=expected_names,
+    )
+    log.info(f"{max_validation_rows=}, {len(sliced_rows)=}, {len(query_texts)=}")
+    return sliced_payload
 
 
 def _read_validated_rows(input_jsonl: str) -> list[ValidatedSkillQuestionRow]:
@@ -382,6 +424,21 @@ def _build_corpus(
     return payload
 
 
+def _sanitize_model_name(model_name: str) -> str:
+    """Converts model name to a filesystem-safe identifier."""
+    sanitized_model_name = re.sub(r"[^a-zA-Z0-9]+", "_", model_name).strip("_")
+    log.info(f"{model_name=}, {sanitized_model_name=}")
+    return sanitized_model_name or "model"
+
+
+def _build_collection_name(field_key: str, model_name: str) -> str:
+    """Builds Chroma collection name from field and model."""
+    sanitized_model_name = _sanitize_model_name(model_name=model_name)
+    collection_name = f"{field_key}_{sanitized_model_name}"
+    log.info(f"{field_key=}, {collection_name=}")
+    return collection_name
+
+
 def _build_queries(
     rows: Sequence[SummaryRetrieverDataModel],
     query_instruction: str,
@@ -416,6 +473,94 @@ def _encode_sentence_embeddings(
     )
     log.info(f"{batch_size=}, {len(texts)=}")
     return np.asarray(embeddings)
+
+
+def _load_hf_encoder(model_name: str) -> _HfEncoderAssets:
+    """Loads tokenizer and model for Hugging Face encoder inference."""
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    model.eval()
+    assets = _HfEncoderAssets(tokenizer=tokenizer, model=model, device=device)
+    log.info(f"{model_name=}, {assets.device=}")
+    return assets
+
+
+def _mean_pool_embeddings(
+    last_hidden_state: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Computes attention-mask mean pooling for sentence embeddings."""
+    mask = attention_mask.unsqueeze(-1).to(last_hidden_state.dtype)
+    masked_hidden = last_hidden_state * mask
+    summed_hidden = masked_hidden.sum(dim=1)
+    summed_mask = mask.sum(dim=1).clamp(min=1e-9)
+    return summed_hidden / summed_mask
+
+
+def _encode_hf_sentence_embeddings(
+    assets: _HfEncoderAssets,
+    texts: Sequence[str],
+    batch_size: int,
+) -> np.ndarray:
+    """Encodes normalized sentence embeddings with Hugging Face transformers."""
+    all_embeddings: list[np.ndarray] = []
+    for start_index in range(0, len(texts), batch_size):
+        text_batch = list(texts[start_index : start_index + batch_size])
+        tokenized = assets.tokenizer(
+            text_batch,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+            max_length=512,
+        )
+        tokenized = {k: v.to(assets.device) for k, v in tokenized.items()}
+        with torch.no_grad():
+            outputs = assets.model(**tokenized)
+        pooled = _mean_pool_embeddings(
+            last_hidden_state=outputs.last_hidden_state,
+            attention_mask=tokenized["attention_mask"],
+        )
+        normalized = torch.nn.functional.normalize(pooled, p=2, dim=1)
+        all_embeddings.append(normalized.detach().cpu().numpy().astype(np.float32))
+    embeddings = np.vstack(all_embeddings)
+    log.info(f"{len(texts)=}, {batch_size=}, {embeddings.shape=}")
+    return embeddings
+
+
+def _encode_hf_token_embeddings(
+    assets: _HfEncoderAssets,
+    texts: Sequence[str],
+    batch_size: int,
+) -> list[np.ndarray]:
+    """Encodes token-level embeddings for ColBERT-style late interaction."""
+    token_embeddings: list[np.ndarray] = []
+    for start_index in range(0, len(texts), batch_size):
+        text_batch = list(texts[start_index : start_index + batch_size])
+        tokenized = assets.tokenizer(
+            text_batch,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+            max_length=512,
+        )
+        attention_mask = tokenized["attention_mask"]
+        tokenized = {k: v.to(assets.device) for k, v in tokenized.items()}
+        with torch.no_grad():
+            outputs = assets.model(**tokenized)
+        hidden_state = outputs.last_hidden_state.detach().cpu()
+        attention_mask = attention_mask.detach().cpu()
+        for row_index in range(hidden_state.shape[0]):
+            active_tokens = attention_mask[row_index].bool()
+            token_matrix = hidden_state[row_index][active_tokens].numpy().astype(
+                np.float32
+            )
+            norms = np.linalg.norm(token_matrix, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            token_embeddings.append(token_matrix / norms)
+    log.info(f"{len(texts)=}, {batch_size=}, {len(token_embeddings)=}")
+    return token_embeddings
 
 
 def _encode_token_embeddings(
@@ -587,6 +732,36 @@ def _score_bm25(
     return score_matrix
 
 
+def _build_bm25_cache_path(artifacts_root: str, field_key: str) -> Path:
+    """Builds path for cached BM25 input corpus for one field."""
+    bm25_cache_path = Path(artifacts_root) / "bm25_cache" / f"{field_key}.json"
+    log.info(f"{field_key=}, {bm25_cache_path=}")
+    return bm25_cache_path
+
+
+def _load_or_write_bm25_docs(
+    artifacts_root: str,
+    field_key: str,
+    corpus: _CorpusPayload,
+    force_reindex: bool,
+) -> list[str]:
+    """Loads cached BM25 docs or writes cache from current corpus."""
+    bm25_cache_path = _build_bm25_cache_path(
+        artifacts_root=artifacts_root, field_key=field_key
+    )
+    if bm25_cache_path.exists() and not force_reindex:
+        payload = json.loads(bm25_cache_path.read_text(encoding="utf-8"))
+        documents = [str(item) for item in payload.get("documents", corpus.texts)]
+        log.info(f"{bm25_cache_path=}, loaded_from_cache=True, {len(documents)=}")
+        return documents
+
+    bm25_cache_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"documents": corpus.texts}
+    bm25_cache_path.write_text(json.dumps(payload), encoding="utf-8")
+    log.info(f"{bm25_cache_path=}, loaded_from_cache=False, {len(corpus.texts)=}")
+    return corpus.texts
+
+
 def _find_expected_rank(
     top_indices: Sequence[int],
     corpus_names: Sequence[str],
@@ -682,20 +857,50 @@ def _encode_sentence_backend(
     return encoded_queries, encoded_corpus
 
 
+def _encode_hf_sentence_backend(
+    model_name: str,
+    query_texts: Sequence[str],
+    doc_texts: Sequence[str],
+    sentence_batch_size: int,
+) -> tuple[_EncodedQueries, _EncodedCorpus]:
+    """Encodes sentence embeddings via Hugging Face transformers."""
+    assets = _load_hf_encoder(model_name=model_name)
+    query_embeddings = _encode_hf_sentence_embeddings(
+        assets=assets,
+        texts=query_texts,
+        batch_size=sentence_batch_size,
+    )
+    doc_embeddings = _encode_hf_sentence_embeddings(
+        assets=assets,
+        texts=doc_texts,
+        batch_size=sentence_batch_size,
+    )
+    encoded_queries = _EncodedQueries(
+        sentence_embeddings=query_embeddings,
+        token_embeddings=None,
+    )
+    encoded_corpus = _EncodedCorpus(
+        sentence_embeddings=doc_embeddings,
+        token_embeddings=None,
+    )
+    return encoded_queries, encoded_corpus
+
+
 def _encode_late_interaction_backend(
-    model: SentenceTransformer,
+    model_name: str,
     query_texts: Sequence[str],
     doc_texts: Sequence[str],
     sentence_batch_size: int,
 ) -> tuple[_EncodedQueries, _EncodedCorpus]:
     """Encodes token-level vectors for late-interaction retrieval."""
-    query_tokens = _encode_token_embeddings(
-        model=model,
+    assets = _load_hf_encoder(model_name=model_name)
+    query_tokens = _encode_hf_token_embeddings(
+        assets=assets,
         texts=query_texts,
         batch_size=sentence_batch_size,
     )
-    doc_tokens = _encode_token_embeddings(
-        model=model,
+    doc_tokens = _encode_hf_token_embeddings(
+        assets=assets,
         texts=doc_texts,
         batch_size=sentence_batch_size,
     )
@@ -832,18 +1037,26 @@ def evaluate(
         config=wandb_config,
     )
 
+    use_hf_sentence_backend = "bert" in retrieval_model.casefold()
     if retrieval_backend == "bi_encoder":
-        model = SentenceTransformer(retrieval_model)
-        encoded_queries, encoded_corpus = _encode_sentence_backend(
-            model=model,
-            query_texts=queries.texts,
-            doc_texts=corpus.texts,
-            sentence_batch_size=sentence_batch_size,
-        )
+        if use_hf_sentence_backend:
+            encoded_queries, encoded_corpus = _encode_hf_sentence_backend(
+                model_name=retrieval_model,
+                query_texts=queries.texts,
+                doc_texts=corpus.texts,
+                sentence_batch_size=sentence_batch_size,
+            )
+        else:
+            model = SentenceTransformer(retrieval_model)
+            encoded_queries, encoded_corpus = _encode_sentence_backend(
+                model=model,
+                query_texts=queries.texts,
+                doc_texts=corpus.texts,
+                sentence_batch_size=sentence_batch_size,
+            )
     elif retrieval_backend == "late_interaction":
-        model = SentenceTransformer(retrieval_model)
         encoded_queries, encoded_corpus = _encode_late_interaction_backend(
-            model=model,
+            model_name=retrieval_model,
             query_texts=queries.texts,
             doc_texts=corpus.texts,
             sentence_batch_size=sentence_batch_size,
@@ -903,17 +1116,116 @@ def _build_validation_wandb_config(
     validation_parquet: str,
     run_name: str,
     sentence_batch_size: int,
+    retrieval_model: str,
+    force_reindex: bool,
+    max_validation_rows: int,
 ) -> dict[str, object]:
     """Builds W&B config for validation parquet evaluation."""
     config = {
         "validation_parquet": validation_parquet,
         "run_name": run_name,
         "sentence_batch_size": sentence_batch_size,
+        "retrieval_model": retrieval_model,
+        "force_reindex": force_reindex,
+        "max_validation_rows": max_validation_rows,
         "fields": [field.field_key for field in VALIDATION_FIELD_CONFIGS],
-        "models": [model.model_name for model in VALIDATION_MODEL_CONFIGS],
+        "models": [retrieval_model, "bm25"],
     }
     log.info(f"{config=}")
     return config
+
+
+def _maybe_start_vllm_server(
+    model_name: str,
+    vllm_port: int,
+    vllm_gpu_device: int,
+    vllm_gpu_memory_utilization: float,
+    start_vllm_server: bool,
+) -> subprocess.Popen[bytes] | None:
+    """Starts vLLM server in the background when requested."""
+    if not start_vllm_server:
+        return None
+
+    command = [
+        "uv",
+        "run",
+        "vllm",
+        "serve",
+        model_name,
+        "--gpu-memory-utilization",
+        str(vllm_gpu_memory_utilization),
+        "--runner",
+        "pooling",
+        "--max-model-len",
+        "8192",
+        "--port",
+        str(vllm_port),
+        "--host",
+        "0.0.0.0",
+    ]
+    environment = dict(os.environ)
+    environment["CUDA_VISIBLE_DEVICES"] = str(vllm_gpu_device)
+    process = subprocess.Popen(
+        command,
+        env=environment,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    log.info(f"{command=}, {process.pid=}")
+    time.sleep(5)
+    return process
+
+
+def _load_chroma_corpus_artifacts(
+    artifacts_root: str,
+    field_key: str,
+    model_name: str,
+    corpus: _CorpusPayload,
+    force_reindex: bool,
+    batch_size: int,
+    vllm_base_url: str,
+    vllm_api_key: str,
+    vllm_max_concurrency: int,
+) -> _ChromaCorpusArtifacts:
+    """Loads cached corpus embeddings from Chroma or indexes them once."""
+    chroma_path = Path(artifacts_root) / "chroma_validation"
+    chroma_path.mkdir(parents=True, exist_ok=True)
+    client = chromadb.PersistentClient(path=str(chroma_path))
+    collection_name = _build_collection_name(field_key=field_key, model_name=model_name)
+    collection = client.get_or_create_collection(name=collection_name)
+    current_count = collection.count()
+    log.info(f"{collection_name=}, {current_count=}, {force_reindex=}")
+
+    if current_count > 0 and not force_reindex:
+        existing = collection.get(include=["embeddings", "metadatas"], limit=current_count)
+        embeddings = np.asarray(existing["embeddings"], dtype=np.float32)
+        metadatas = existing.get("metadatas") or []
+        names = [str(metadata.get("name", "")) for metadata in metadatas]
+        return _ChromaCorpusArtifacts(embeddings=embeddings, names=names)
+
+    if current_count > 0:
+        existing_ids = collection.get(include=[], limit=current_count).get("ids", [])
+        collection.delete(ids=existing_ids)
+
+    client_async = AsyncOpenAI(base_url=vllm_base_url, api_key=vllm_api_key)
+    embeddings = asyncio.run(
+        _encode_vllm_async(
+            client=client_async,
+            embedding_model=model_name,
+            texts=corpus.texts,
+            batch_size=batch_size,
+            max_concurrency=vllm_max_concurrency,
+        )
+    )
+    ids = [f"{field_key}_{index}" for index in range(len(corpus.texts))]
+    metadatas = [{"name": name} for name in corpus.names]
+    collection.add(
+        ids=ids,
+        documents=corpus.texts,
+        embeddings=embeddings.tolist(),
+        metadatas=metadatas,
+    )
+    return _ChromaCorpusArtifacts(embeddings=embeddings, names=corpus.names)
 
 
 def _build_validation_payload(
@@ -949,17 +1261,40 @@ def _build_validation_output(
 
 
 def evaluate_validation_parquet(
-    validation_parquet: str = "Validation.parquet",
+    validation_parquet: str = "artifacts/val.parquet",
+    retrieval_model: str = "Qwen/Qwen3-Embedding-0.6B",
+    force_reindex: bool = False,
+    artifacts_root: str = "artifacts",
+    vllm_base_url: str = "http://127.0.0.1:8000/v1",
+    vllm_api_key: str = "EMPTY",
+    vllm_batch_size: int = 64,
+    vllm_max_concurrency: int = 8,
+    start_vllm_server: bool = True,
+    vllm_gpu_device: int = 3,
+    vllm_port: int = 8000,
+    vllm_gpu_memory_utilization: float = 0.9,
     wandb_project: str = "ast-skills-retriever",
     wandb_entity: str = "",
     run_name: str = "validation-parquet-eval",
     sentence_batch_size: int = 64,
+    max_validation_rows: int = 0,
 ) -> dict[str, dict[str, dict[str, float]]]:
     """Evaluates summary/description retrieval on validation parquet.
 
     Runs BERT large encoder, Qwen3-0.6B, and BM25 across both retrieval fields.
     """
+    vllm_process = _maybe_start_vllm_server(
+        model_name=retrieval_model,
+        vllm_port=vllm_port,
+        vllm_gpu_device=vllm_gpu_device,
+        vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
+        start_vllm_server=start_vllm_server,
+    )
     validation_payload = _load_validation_payload(validation_parquet=validation_parquet)
+    validation_payload = _slice_validation_payload(
+        payload=validation_payload,
+        max_validation_rows=max_validation_rows,
+    )
     metrics_by_field: dict[str, dict[str, RetrievalMetrics]] = {}
 
     wandb.init(
@@ -970,49 +1305,74 @@ def evaluate_validation_parquet(
             validation_parquet=validation_parquet,
             run_name=run_name,
             sentence_batch_size=sentence_batch_size,
+            retrieval_model=retrieval_model,
+            force_reindex=force_reindex,
+            max_validation_rows=max_validation_rows,
         ),
     )
 
-    for field_config in VALIDATION_FIELD_CONFIGS:
-        field_key = field_config.field_key
-        corpus = _build_validation_corpus(
-            rows=validation_payload.rows,
-            field_key=field_key,
-        )
-        metrics_by_model: dict[str, RetrievalMetrics] = {}
-        for model_config in VALIDATION_MODEL_CONFIGS:
-            log.info(f"{field_key=}, {model_config.model_key=}")
-            if model_config.model_type == "dense":
-                model = SentenceTransformer(model_config.model_name)
-                query_embeddings = _encode_sentence_embeddings(
-                    model=model,
-                    texts=validation_payload.query_texts,
-                    batch_size=sentence_batch_size,
-                )
-                doc_embeddings = _encode_sentence_embeddings(
-                    model=model,
-                    texts=corpus.texts,
-                    batch_size=sentence_batch_size,
-                )
-                score_matrix = _score_bi_encoder(
-                    query_embeddings=query_embeddings,
-                    doc_embeddings=doc_embeddings,
-                )
-            elif model_config.model_type == "sparse":
-                score_matrix = _score_bm25(
-                    query_texts=validation_payload.query_texts,
-                    doc_texts=corpus.texts,
-                )
-            else:
-                raise ValueError(f"Unsupported model type: {model_config.model_type}")
+    try:
+        for field_config in VALIDATION_FIELD_CONFIGS:
+            field_key = field_config.field_key
+            corpus = _build_validation_corpus(
+                rows=validation_payload.rows,
+                field_key=field_key,
+            )
+            metrics_by_model: dict[str, RetrievalMetrics] = {}
 
-            metrics = _compute_metrics(
-                score_matrix=score_matrix,
+            chroma_artifacts = _load_chroma_corpus_artifacts(
+                artifacts_root=artifacts_root,
+                field_key=field_key,
+                model_name=retrieval_model,
+                corpus=corpus,
+                force_reindex=force_reindex,
+                batch_size=vllm_batch_size,
+                vllm_base_url=vllm_base_url,
+                vllm_api_key=vllm_api_key,
+                vllm_max_concurrency=vllm_max_concurrency,
+            )
+            query_client = AsyncOpenAI(base_url=vllm_base_url, api_key=vllm_api_key)
+            query_embeddings = asyncio.run(
+                _encode_vllm_async(
+                    client=query_client,
+                    embedding_model=retrieval_model,
+                    texts=validation_payload.query_texts,
+                    batch_size=vllm_batch_size,
+                    max_concurrency=vllm_max_concurrency,
+                )
+            )
+            dense_score_matrix = _score_bi_encoder(
+                query_embeddings=query_embeddings,
+                doc_embeddings=chroma_artifacts.embeddings,
+            )
+            dense_metrics = _compute_metrics(
+                score_matrix=dense_score_matrix,
+                expected_names=validation_payload.expected_names,
+                corpus_names=chroma_artifacts.names,
+            )
+            metrics_by_model[_sanitize_model_name(retrieval_model)] = dense_metrics
+
+            bm25_doc_texts = _load_or_write_bm25_docs(
+                artifacts_root=artifacts_root,
+                field_key=field_key,
+                corpus=corpus,
+                force_reindex=force_reindex,
+            )
+            bm25_score_matrix = _score_bm25(
+                query_texts=validation_payload.query_texts,
+                doc_texts=bm25_doc_texts,
+            )
+            bm25_metrics = _compute_metrics(
+                score_matrix=bm25_score_matrix,
                 expected_names=validation_payload.expected_names,
                 corpus_names=corpus.names,
             )
-            metrics_by_model[model_config.model_key] = metrics
-        metrics_by_field[field_key] = metrics_by_model
+            metrics_by_model["bm25"] = bm25_metrics
+            metrics_by_field[field_key] = metrics_by_model
+    finally:
+        if vllm_process is not None:
+            vllm_process.terminate()
+            log.info(f"{vllm_process.pid=}, stopped=True")
 
     wandb.log(_build_validation_payload(metrics_by_field))
     table_rows = []
@@ -1046,6 +1406,68 @@ def evaluate_validation_parquet(
     wandb.log({"eval/model_comparison": table})
     wandb.finish()
     return _build_validation_output(metrics_by_field)
+
+
+def build_validation_indexes(
+    validation_parquet: str = "artifacts/val.parquet",
+    retrieval_model: str = "Qwen/Qwen3-Embedding-0.6B",
+    force_reindex: bool = False,
+    artifacts_root: str = "artifacts",
+    vllm_base_url: str = "http://127.0.0.1:8000/v1",
+    vllm_api_key: str = "EMPTY",
+    vllm_batch_size: int = 64,
+    vllm_max_concurrency: int = 8,
+    start_vllm_server: bool = True,
+    vllm_gpu_device: int = 3,
+    vllm_port: int = 8000,
+    vllm_gpu_memory_utilization: float = 0.9,
+) -> dict[str, dict[str, int]]:
+    """Builds and caches Chroma and BM25 artifacts for validation retrieval."""
+    vllm_process = _maybe_start_vllm_server(
+        model_name=retrieval_model,
+        vllm_port=vllm_port,
+        vllm_gpu_device=vllm_gpu_device,
+        vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
+        start_vllm_server=start_vllm_server,
+    )
+    validation_payload = _load_validation_payload(validation_parquet=validation_parquet)
+    output: dict[str, dict[str, int]] = {}
+
+    try:
+        for field_config in VALIDATION_FIELD_CONFIGS:
+            field_key = field_config.field_key
+            corpus = _build_validation_corpus(
+                rows=validation_payload.rows,
+                field_key=field_key,
+            )
+            chroma_artifacts = _load_chroma_corpus_artifacts(
+                artifacts_root=artifacts_root,
+                field_key=field_key,
+                model_name=retrieval_model,
+                corpus=corpus,
+                force_reindex=force_reindex,
+                batch_size=vllm_batch_size,
+                vllm_base_url=vllm_base_url,
+                vllm_api_key=vllm_api_key,
+                vllm_max_concurrency=vllm_max_concurrency,
+            )
+            bm25_docs = _load_or_write_bm25_docs(
+                artifacts_root=artifacts_root,
+                field_key=field_key,
+                corpus=corpus,
+                force_reindex=force_reindex,
+            )
+            output[field_key] = {
+                "chroma_docs": int(chroma_artifacts.embeddings.shape[0]),
+                "bm25_docs": len(bm25_docs),
+            }
+    finally:
+        if vllm_process is not None:
+            vllm_process.terminate()
+            log.info(f"{vllm_process.pid=}, stopped=True")
+
+    log.info(f"{output=}")
+    return output
 
 
 async def evaluate_validated_skill_questions_async(
@@ -1164,6 +1586,7 @@ def main() -> None:
             "evaluate": evaluate,
             "evaluate_from_config": evaluate_from_config,
             "evaluate_validation_parquet": evaluate_validation_parquet,
+            "build_validation_indexes": build_validation_indexes,
             "evaluate_validated_skill_questions": evaluate_validated_skill_questions,
         }
     )
