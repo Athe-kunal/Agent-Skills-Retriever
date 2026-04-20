@@ -1,5 +1,6 @@
 input:
   mined_parquet_path: artifacts/retriever_training/train.parquet
+  validation_parquet_path: artifacts/retriever_training/validation.parquet
 
 model:
   name: Qwen/Qwen3-Embedding-0.6B
@@ -9,6 +10,8 @@ training:
   batch_size: 32
   learning_rate: 2.0e-5
   warmup_steps: 200
+  evaluation_steps: 200
+  checkpoint_save_steps: 200
   seed: 13
 
 output:

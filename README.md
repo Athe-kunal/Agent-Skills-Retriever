@@ -59,8 +59,9 @@ By default this reads `configs/train.config.yaml`.
 The training config is split into sections:
 
 - `input.mined_parquet_path`
+- `input.validation_parquet_path` (optional validation metrics dataset)
 - `model.name`
-- `training.{epochs,batch_size,learning_rate,warmup_steps,seed}`
+- `training.{epochs,batch_size,learning_rate,warmup_steps,evaluation_steps,checkpoint_save_steps,seed}`
 - `output.dir`
 - `logging.use_wandb` (default `true`) plus optional W&B metadata
 
