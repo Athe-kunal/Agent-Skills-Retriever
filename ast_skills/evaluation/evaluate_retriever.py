@@ -19,6 +19,7 @@ import re
 import socket
 import subprocess
 import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Sequence
 from urllib.error import HTTPError, URLError
@@ -261,6 +262,7 @@ _VLLM_STARTUP_POLL_INTERVAL_SEC = 2.0
 _VLLM_STARTUP_TIMEOUT_SEC = 600.0
 _VLLM_STARTUP_PROBE_TIMEOUT_SEC = 5.0
 _CHROMA_ADD_BATCH_SIZE = 5000
+_BM25_N_WORKERS = os.cpu_count() or 1
 
 
 def _data_point_from_parquet_record(record: dict[str, Any]) -> DataPoint:
@@ -874,21 +876,40 @@ def _tokenize_for_bm25(text: str) -> list[str]:
     return text.casefold().split()
 
 
+def _score_bm25_chunk(args: tuple[list[list[str]], list[str]]) -> np.ndarray:
+    """Scores one chunk of queries against a BM25 index built from tokenized_docs."""
+    tokenized_docs, query_chunk = args
+    bm25 = BM25Okapi(tokenized_docs)
+    return np.vstack([
+        np.asarray(bm25.get_scores(_tokenize_for_bm25(query_text)), dtype=np.float32)
+        for query_text in query_chunk
+    ])
+
+
 def _score_bm25(
     query_texts: Sequence[str],
     doc_texts: Sequence[str],
+    n_workers: int = _BM25_N_WORKERS,
 ) -> np.ndarray:
-    """Returns BM25 score matrix for all query-document pairs."""
+    """Returns BM25 score matrix using parallel workers, one chunk per worker."""
     tokenized_docs = [_tokenize_for_bm25(text) for text in doc_texts]
-    bm25 = BM25Okapi(tokenized_docs)
-    score_rows: list[np.ndarray] = []
-    for query_text in query_texts:
-        tokenized_query = _tokenize_for_bm25(query_text)
-        score_rows.append(
-            np.asarray(bm25.get_scores(tokenized_query), dtype=np.float32)
+    query_list = list(query_texts)
+    chunk_size = max(1, (len(query_list) + n_workers - 1) // n_workers)
+    chunks = [query_list[i : i + chunk_size] for i in range(0, len(query_list), chunk_size)]
+    args_list = [(tokenized_docs, chunk) for chunk in chunks]
+
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        chunk_results = list(
+            tqdm(
+                executor.map(_score_bm25_chunk, args_list),
+                total=len(chunks),
+                desc="BM25 parallel scoring",
+                unit="chunk",
+            )
         )
-    score_matrix = np.vstack(score_rows)
-    log.info(f"{score_matrix.shape=}")
+
+    score_matrix = np.vstack(chunk_results)
+    log.info(f"{score_matrix.shape=}, {n_workers=}")
     return score_matrix
 
 
@@ -902,6 +923,52 @@ def _rank_positions_from_scores(score_matrix: np.ndarray) -> np.ndarray:
     )
     log.info(f"{score_matrix.shape=}, {rank_positions.shape=}")
     return rank_positions
+
+
+def _build_bm25_score_cache_path(artifacts_root: str, field_key: str) -> Path:
+    """Builds path for the cached BM25 score matrix for one field."""
+    return Path(artifacts_root) / "bm25_cache" / f"{field_key}_score_matrix.npy"
+
+
+def _load_or_compute_bm25_score_matrix(
+    artifacts_root: str,
+    field_key: str,
+    query_texts: Sequence[str],
+    bm25_cache: _BM25CachePayload,
+    force_reindex: bool,
+    n_workers: int = _BM25_N_WORKERS,
+) -> np.ndarray:
+    """Loads the cached BM25 score matrix from disk, or computes and caches it.
+
+    The cache is keyed by shape: if the stored matrix matches
+    (n_queries, n_docs) it is reused, otherwise it is recomputed.
+    """
+    cache_path = _build_bm25_score_cache_path(
+        artifacts_root=artifacts_root, field_key=field_key
+    )
+    expected_shape = (len(query_texts), len(bm25_cache.texts))
+
+    if cache_path.exists() and not force_reindex:
+        score_matrix = np.load(str(cache_path))
+        if score_matrix.shape == expected_shape:
+            log.info(
+                f"{cache_path=}, loaded_from_cache=True, {score_matrix.shape=}"
+            )
+            return score_matrix
+        log.info(
+            f"{cache_path=}, shape_mismatch={score_matrix.shape} vs "
+            f"{expected_shape=}, recomputing"
+        )
+
+    score_matrix = _score_bm25(
+        query_texts=query_texts,
+        doc_texts=bm25_cache.texts,
+        n_workers=n_workers,
+    )
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(str(cache_path), score_matrix)
+    log.info(f"{cache_path=}, loaded_from_cache=False, {score_matrix.shape=}")
+    return score_matrix
 
 
 def _score_hybrid_rrf(
@@ -1791,9 +1858,12 @@ def evaluate_validation_parquet(
                     corpus=corpus,
                     force_reindex=force_reindex,
                 )
-                bm25_score_matrix = _score_bm25(
+                bm25_score_matrix = _load_or_compute_bm25_score_matrix(
+                    artifacts_root=artifacts_root,
+                    field_key=field_key,
                     query_texts=validation_payload.query_texts,
-                    doc_texts=bm25_cache.texts,
+                    bm25_cache=bm25_cache,
+                    force_reindex=force_reindex,
                 )
                 bm25_metrics = _compute_metrics(
                     score_matrix=bm25_score_matrix,
@@ -1827,8 +1897,7 @@ def evaluate_validation_parquet(
         for model_key, metrics in metrics_by_model.items():
             table_rows.append(
                 [
-                    field_key,
-                    model_key,
+                    f"{field_key}_{model_key}",
                     metrics.total_queries,
                     metrics.hit_at_1,
                     metrics.hit_at_3,
@@ -1839,8 +1908,7 @@ def evaluate_validation_parquet(
             )
     table = wandb.Table(
         columns=[
-            "field",
-            "model",
+            "retrieval_config",
             "queries",
             "hit_at_1",
             "hit_at_3",
@@ -1898,9 +1966,12 @@ def evaluate_validation_bm25_parquet(
             corpus=corpus,
             force_reindex=force_reindex,
         )
-        bm25_score_matrix = _score_bm25(
+        bm25_score_matrix = _load_or_compute_bm25_score_matrix(
+            artifacts_root=artifacts_root,
+            field_key=field_key,
             query_texts=validation_payload.query_texts,
-            doc_texts=bm25_cache.texts,
+            bm25_cache=bm25_cache,
+            force_reindex=force_reindex,
         )
         bm25_metrics = _compute_metrics(
             score_matrix=bm25_score_matrix,
@@ -2165,6 +2236,7 @@ def main() -> None:
             "evaluate": evaluate,
             "evaluate_from_config": evaluate_from_config,
             "evaluate_validation_parquet": evaluate_validation_parquet,
+            "evaluate_validation_bm25_parquet": evaluate_validation_bm25_parquet,
             "build_validation_indexes": build_validation_indexes,
             "evaluate_validated_skill_questions": evaluate_validated_skill_questions,
         }

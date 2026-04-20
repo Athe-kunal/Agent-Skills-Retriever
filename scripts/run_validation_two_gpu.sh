@@ -58,7 +58,7 @@ main() {
   local wandb_project="${3:-ast-skills-retriever}"
   local wandb_entity="${4:-}"
 
-  run_bm25_eval "${validation_parquet}" "${wandb_project}" "${wandb_entity}"
+  # run_bm25_eval "${validation_parquet}" "${wandb_project}" "${wandb_entity}"
 
   local models=()
   parse_models "${models_csv}" models
