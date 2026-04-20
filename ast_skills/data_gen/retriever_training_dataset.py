@@ -46,7 +46,7 @@ class _HybridSearchConfig(NamedTuple):
     embedding_base_url: str
     embedding_model: str
     api_key: str
-    top_k: int
+    retrieval_pool_size: int
     rrf_k: int
 
 
@@ -333,7 +333,7 @@ def _bm25_ranked_ids_for_field(
         query=question,
         field=field,
         root_dir=config.chroma_root_dir,
-        limit=config.top_k,
+        limit=config.retrieval_pool_size,
     )
 
 
@@ -409,14 +409,14 @@ def _hybrid_ranked_ids_precomputed(
         query_embedding=query_embedding,
         field=field,
         root_dir=config.chroma_root_dir,
-        limit=config.top_k,
+        limit=config.retrieval_pool_size,
     )
     dense_ids = _parse_hybrid_search_ids(dense_json)
     sparse_ids = bm25_cache.get((question, field), [])
     return rrf_merge_ids(
         dense_ids=dense_ids,
         sparse_ids=sparse_ids,
-        limit=config.top_k,
+        limit=config.retrieval_pool_size,
         rrf_k=config.rrf_k,
     )
 
@@ -460,7 +460,7 @@ def _mine_field_negatives(
         if text and text not in seen_texts:
             seen_texts.add(text)
             negatives.append(text)
-        if len(negatives) > window_config.negatives_per_row:
+        if len(negatives) >= window_config.negatives_per_row:
             break
 
     log.info(f"{field=}, {len(negatives)=}")
@@ -662,7 +662,7 @@ def build_training_and_validation_datasets(
     embedding_base_url: str = "http://127.0.0.1:8000/v1",
     embedding_model: str = "Qwen/Qwen3-Embedding-8B",
     api_key: str = "EMPTY",
-    top_k: int = 100,
+    retrieval_pool_size: int = 200,
     rrf_k: int = 60,
     window_start_rank: int = 5,
     negatives_per_row: int = 32,
@@ -683,7 +683,9 @@ def build_training_and_validation_datasets(
       embedding_base_url: OpenAI-compatible embedding endpoint.
       embedding_model: Embedding model used for dense query encoding.
       api_key: API key for embedding endpoint.
-      top_k: Hybrid retrieval top-K.
+      retrieval_pool_size: Number of candidates retrieved per query (BM25 + dense).
+        Must be well above ``negatives_per_row`` so deduplication still leaves
+        enough unique candidates after filtering the positive and the window.
       rrf_k: Reciprocal-rank-fusion constant.
       window_start_rank: First rank (1-indexed) to start accumulating summary negatives.
         Ranks below this are skipped (too easy / too similar to the positive).
@@ -713,7 +715,7 @@ def build_training_and_validation_datasets(
         embedding_base_url=embedding_base_url,
         embedding_model=embedding_model,
         api_key=api_key,
-        top_k=top_k,
+        retrieval_pool_size=retrieval_pool_size,
         rrf_k=rrf_k,
     )
     window_config = _NegativeWindowConfig(

@@ -12,7 +12,7 @@ TRAINING_DATASET_PARQUET ?= artifacts/train.parquet
 RETRIEVER_PARQUET ?= $(TRAINING_DATASET_PARQUET)
 MINED_TRAIN_PARQUET ?= artifacts/retriever_training/train.parquet
 MINED_VALIDATION_PARQUET ?= artifacts/retriever_training/validation.parquet
-MINED_TOP_K ?= 37
+MINED_RETRIEVAL_POOL_SIZE ?= 200
 MINED_WINDOW_START ?= 6
 MINED_NEGATIVES_PER_ROW ?= 32
 MINED_RANDOM_SEED ?= 13
@@ -73,7 +73,7 @@ build-mined-negatives-parquet:
 		--random_seed $(MINED_RANDOM_SEED) \
 		--validation_ratio $(MINED_VALIDATION_RATIO) \
 		--max_concurrency $(MINED_MAX_CONCURRENCY) \
-		--top_k $(MINED_TOP_K) \
+		--retrieval_pool_size $(MINED_RETRIEVAL_POOL_SIZE) \
 		--window_start_rank $(MINED_WINDOW_START) \
 		--negatives_per_row $(MINED_NEGATIVES_PER_ROW)
 
