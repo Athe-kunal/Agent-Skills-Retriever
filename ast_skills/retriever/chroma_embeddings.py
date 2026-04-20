@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Sequence
 
 import chromadb
 import fire
@@ -12,6 +12,11 @@ from chromadb.api.models.Collection import Collection
 from loguru import logger as log
 from openai import OpenAI
 
+from ast_skills.data_gen.retriever_training_dataset import (
+    _REQUIRED_PARQUET_COLUMNS,
+    _coerce_seed_questions_list,
+    _read_parquet,
+)
 from ast_skills.retriever.bm25_index import write_bm25_index
 from ast_skills.retriever.datamodels import RetrieverDataModel
 
@@ -47,9 +52,24 @@ FIELD_CONFIGS: tuple[_FieldBuildConfig, ...] = (
 )
 
 
-def _parse_field_filter(only_fields: str) -> set[str]:
-    """Parses and validates the optional field filter."""
-    field_filter = {field.strip() for field in only_fields.split(",") if field.strip()}
+def _parse_field_filter(
+    only_fields: str | Sequence[str] | None,
+) -> set[str]:
+    """Parses and validates the optional field filter.
+
+    Accepts a comma-separated string (CLI) or a tuple/list (some Fire call paths).
+    """
+    if only_fields is None or only_fields == "":
+        return set()
+    if isinstance(only_fields, str):
+        parts = only_fields.split(",")
+    elif isinstance(only_fields, (tuple, list)):
+        parts = only_fields
+    else:
+        raise TypeError(
+            f"only_fields must be str, tuple, or list, got {type(only_fields).__name__}"
+        )
+    field_filter = {str(field).strip() for field in parts if str(field).strip()}
     supported_fields = {config.field_name for config in FIELD_CONFIGS}
     invalid_fields = sorted(field_filter - supported_fields)
     if invalid_fields:
@@ -60,39 +80,27 @@ def _parse_field_filter(only_fields: str) -> set[str]:
     return field_filter
 
 
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    """Reads JSONL rows from disk."""
-    rows: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            stripped_line = line.strip()
-            if not stripped_line:
-                continue
-            row = json.loads(stripped_line)
-            if not isinstance(row, dict):
-                raise ValueError(
-                    f"Expected dict row, got {type(row)=} at {line_number=}"
-                )
-            rows.append(row)
-    log.info(f"{path=}, {len(rows)=}")
-    return rows
-
-
-def _rows_to_models(rows: list[dict[str, Any]]) -> list[RetrieverDataModel]:
-    """Converts dictionary rows into ``RetrieverDataModel`` objects."""
+def _train_parquet_rows_to_retriever_models(
+    rows: list[dict[str, Any]],
+) -> list[RetrieverDataModel]:
+    """Maps train-parquet rows (see ``_REQUIRED_PARQUET_COLUMNS``) to embedding models."""
+    required_keys = set(_REQUIRED_PARQUET_COLUMNS)
     models: list[RetrieverDataModel] = []
-    for row in rows:
-        seed_questions = row.get("seed_questions", [])
-        if not isinstance(seed_questions, list):
-            seed_questions = []
-
+    for row_index, row in enumerate(rows):
+        row_keys = set(row.keys())
+        if row_keys != required_keys:
+            raise KeyError(
+                f"Row {row_index} must have exactly keys {sorted(required_keys)!r}; "
+                f"got {sorted(row_keys)!r}"
+            )
+        seed_questions = _coerce_seed_questions_list(row["question"])
         model = RetrieverDataModel(
-            custom_id=str(row.get("custom_id", "")),
+            custom_id=str(row_index),
             seed_questions=[str(question) for question in seed_questions],
-            name=str(row.get("name", "")),
-            description=str(row.get("description", "")),
-            metadata=dict(row.get("metadata", {})),
-            summary=str(row.get("summary", "")),
+            name=str(row["name"]),
+            description=str(row["description"]),
+            metadata={},
+            summary=str(row["summary"]),
         )
         models.append(model)
     log.info(f"{len(models)=}")
@@ -233,7 +241,7 @@ def _write_bm25_artifact(
 
 
 def build_chroma_databases(
-    input_jsonl_path: str,
+    input_parquet_path: str = "artifacts/train.parquet",
     output_root_dir: str = "artifacts/chroma",
     embedding_base_url: str = "http://127.0.0.1:8000/v1",
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B",
@@ -243,14 +251,18 @@ def build_chroma_databases(
 ) -> None:
     """Builds ChromaDB databases for summary/description fields.
 
+    ``input_parquet_path`` must point to Parquet with columns ``name``,
+    ``markdown_content``, ``summary``, ``description``, and ``question`` (same
+    layout as ``artifacts/train.parquet``).
+
     ``only_fields`` is an optional comma-separated list of field names to build
     (e.g. ``"summary"`` or ``"summary,description"``). When empty, all fields are
     built.
     """
-    input_jsonl = Path(input_jsonl_path)
+    input_parquet = Path(input_parquet_path)
     output_root = Path(output_root_dir)
     log.info(
-        f"{input_jsonl=}, {output_root=}, {embedding_base_url=}, "
+        f"{input_parquet=}, {output_root=}, {embedding_base_url=}, "
         f"{embedding_model=}, {embedding_batch_size=}, {only_fields=}"
     )
 
@@ -262,8 +274,8 @@ def build_chroma_databases(
     ]
     log.info(f"{field_filter=}, building fields: {[c.field_name for c in active_configs]}")
 
-    rows = _read_jsonl(input_jsonl)
-    models = _rows_to_models(rows)
+    rows = _read_parquet(input_parquet)
+    models = _train_parquet_rows_to_retriever_models(rows)
     embedding_client = _make_embedding_client(
         base_url=embedding_base_url, api_key=api_key
     )

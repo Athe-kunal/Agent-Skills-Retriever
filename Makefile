@@ -5,11 +5,11 @@ EMBD_MODEL ?= Qwen/Qwen3-Embedding-8B
 EMBD_GPU_MEMORY_UTILIZATION ?= 0.9
 EMBD_BASE_URL ?= http://127.0.0.1:$(EMBD_PORT)/v1
 EMBD_API_KEY ?= EMPTY
-RETRIEVER_JSONL ?= artifacts/summary_retriever_models.jsonl
 CHROMA_ROOT ?= artifacts/chroma
 ONLY_FIELDS ?= summary,description
 
-TRAINING_DATASET_JSONL ?= artifacts/summary_retriever_models.jsonl
+TRAINING_DATASET_PARQUET ?= artifacts/train.parquet
+RETRIEVER_PARQUET ?= $(TRAINING_DATASET_PARQUET)
 MINED_TRAIN_PARQUET ?= artifacts/retriever_training/train.parquet
 MINED_VALIDATION_PARQUET ?= artifacts/retriever_training/validation.parquet
 MINED_TOP_K ?= 37
@@ -25,11 +25,11 @@ TRAIN_CONFIG_PATH ?= configs/train.config.yaml
 MINED_INPUT_PARQUET ?= artifacts/retriever_training/train.parquet
 MINED_OUTPUT_PARQUET ?= artifacts/retriever_training/training_data.parquet
 MINED_CHROMA_ROOT ?= artifacts/chroma_train_builder
-MINED_EMBEDDING_MODEL ?= Qwen/Qwen3-Embedding-0.6B
+MINED_EMBEDDING_MODEL ?= Qwen/Qwen3-Embedding-8B
 MINED_BASE_URL ?= http://127.0.0.1:$(EMBD_PORT)/v1
 MINED_API_KEY ?= EMPTY
 MINED_EMBED_BATCH_SIZE ?= 256
-MINED_MAX_CONCURRENCY ?= 32
+MINED_MAX_CONCURRENCY ?= 256
 MINED_RETRIEVAL_TOP_K ?= 37
 MINED_DROP_TOP_K ?= 5
 MINED_KEEP_NEGATIVES ?= 32
@@ -44,7 +44,7 @@ EVAL_WANDB_PROJECT ?= ast-skills-retriever
 
 .PHONY: vllm-embd-serve
 vllm-embd-serve:
-	CUDA_VISIBLE_DEVICES=$(GPU_DEVICE) uv run vllm serve $(EMBD_MODEL) \
+	CUDA_VISIBLE_DEVICES=$(GPU_DEVICE) uv run vllm serve $(MINED_EMBEDDING_MODEL) \
 		--gpu-memory-utilization $(EMBD_GPU_MEMORY_UTILIZATION) \
 		--runner pooling \
 		--max-model-len 8192 \
@@ -54,7 +54,7 @@ vllm-embd-serve:
 .PHONY: build-retriever-chroma
 build-retriever-chroma:
 	uv run python -m ast_skills.retriever.chroma_embeddings \
-		--input_jsonl_path $(RETRIEVER_JSONL) \
+		--input_parquet_path $(RETRIEVER_PARQUET) \
 		--output_root_dir $(CHROMA_ROOT) \
 		--embedding_base_url $(EMBD_BASE_URL) \
 		--embedding_model $(EMBD_MODEL) \
@@ -64,7 +64,7 @@ build-retriever-chroma:
 .PHONY: build-mined-negatives-parquet
 build-mined-negatives-parquet:
 	uv run python -m ast_skills.data_gen.retriever_training_dataset build_retriever_training_dataset \
-		--input_jsonl_path $(TRAINING_DATASET_JSONL) \
+		--input_parquet_path $(TRAINING_DATASET_PARQUET) \
 		--output_train_parquet_path $(MINED_TRAIN_PARQUET) \
 		--output_validation_parquet_path $(MINED_VALIDATION_PARQUET) \
 		--chroma_root_dir $(CHROMA_ROOT) \

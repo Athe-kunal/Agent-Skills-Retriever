@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import fire
+import pandas as pd
 from datasets import Dataset, Features, Sequence, Value
 from loguru import logger as log
 
@@ -57,6 +58,14 @@ class _RowQuestion(NamedTuple):
     question: str
 
 
+_REQUIRED_PARQUET_COLUMNS: tuple[str, ...] = (
+    "name",
+    "markdown_content",
+    "summary",
+    "description",
+    "question",
+)
+
 _TRAINING_ROW_FEATURES = Features(
     {
         "question": Value("string"),
@@ -96,18 +105,77 @@ def _normalize_corpus_field_text(text: str) -> str:
     return result
 
 
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    """Reads a JSONL file into dictionaries."""
+def _is_missing_scalar(value: Any) -> bool:
+    """True if ``value`` is None or a pandas/NA missing scalar."""
+    if value is None:
+        return True
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _raise_if_null_parquet_cell(row_index: int, column: str, value: Any) -> None:
+    """Raises ``KeyError`` when a required cell is absent or null."""
+    if _is_missing_scalar(value):
+        raise KeyError(
+            f"Row {row_index} has missing or null value for required column {column!r}"
+        )
+
+
+def _coerce_seed_questions_list(value: Any) -> list[str]:
+    """Builds ``seed_questions`` from a ``question`` cell (string, list, or JSON string).
+
+    Caller must ensure the cell itself is not null (see ``_raise_if_null_parquet_cell``).
+    """
+    if hasattr(value, "tolist") and not isinstance(value, (list, tuple, dict, str, bytes)):
+        value = value.tolist()
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            return [stripped]
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed if not _is_missing_scalar(item)]
+        return [str(parsed)]
+    if isinstance(value, (list, tuple)):
+        return [
+            str(item)
+            for item in value
+            if not _is_missing_scalar(item) and str(item).strip()
+        ]
+    return [str(value)]
+
+
+def _read_parquet(path: Path) -> list[dict[str, Any]]:
+    """Reads train Parquet rows; each dict has only the file columns (no derived fields).
+
+    Expected columns: ``name``, ``markdown_content``, ``summary``, ``description``, ``question``.
+    """
+    dataframe = pd.read_parquet(path)
+    missing_columns = [
+        name for name in _REQUIRED_PARQUET_COLUMNS if name not in dataframe.columns
+    ]
+    if missing_columns:
+        raise KeyError(
+            f"Parquet at {path} is missing required columns: {missing_columns}"
+        )
+    raw_records = dataframe.to_dict(orient="records")
     rows: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            stripped_line = line.strip()
-            if not stripped_line:
-                continue
-            row = json.loads(stripped_line)
-            if not isinstance(row, dict):
-                raise ValueError(f"Expected dict row at {line_number=}, {type(row)=}")
-            rows.append(row)
+    for row_index, record in enumerate(raw_records):
+        for column in _REQUIRED_PARQUET_COLUMNS:
+            _raise_if_null_parquet_cell(row_index, column, record[column])
+        row = {
+            "name": str(record["name"]),
+            "markdown_content": str(record["markdown_content"]),
+            "summary": str(record["summary"]),
+            "description": str(record["description"]),
+            "question": record["question"],
+        }
+        rows.append(row)
     log.info(f"{path=}, {len(rows)=}")
     return rows
 
@@ -137,26 +205,30 @@ def _write_parquet(path: Path, rows: list[TrainingData]) -> None:
 def _rows_to_summary_models(
     rows: list[dict[str, Any]],
 ) -> list[SummaryRetrieverDataModel]:
-    """Converts dictionaries to ``SummaryRetrieverDataModel`` objects."""
+    """Converts train-parquet row dicts (see ``_REQUIRED_PARQUET_COLUMNS``) to models."""
+    required_keys = set(_REQUIRED_PARQUET_COLUMNS)
     models: list[SummaryRetrieverDataModel] = []
-    for row in rows:
+    for row_index, row in enumerate(rows):
+        row_keys = set(row.keys())
+        if row_keys != required_keys:
+            raise KeyError(
+                f"Row {row_index} must have exactly keys {sorted(required_keys)!r}; "
+                f"got {sorted(row_keys)!r}"
+            )
+        seed_questions = _coerce_seed_questions_list(row["question"])
         normalized_seed_questions = [
-            _normalize_corpus_field_text(str(question))
-            for question in row.get("seed_questions", [])
+            _normalize_corpus_field_text(str(question)) for question in seed_questions
         ]
         model = SummaryRetrieverDataModel(
-            custom_id=str(row.get("custom_id", "")),
-            markdown_content=str(row.get("markdown_content", "")),
+            custom_id=str(row_index),
+            markdown_content=str(row["markdown_content"]),
             seed_questions=[
                 question for question in normalized_seed_questions if question.strip()
             ],
-            summary=_normalize_corpus_field_text(str(row.get("summary", ""))),
-            name=str(row.get("name", "")),
-            description=_normalize_corpus_field_text(str(row.get("description", ""))),
-            metadata={
-                str(key): str(value)
-                for key, value in dict(row.get("metadata", {})).items()
-            },
+            summary=_normalize_corpus_field_text(str(row["summary"])),
+            name=str(row["name"]),
+            description=_normalize_corpus_field_text(str(row["description"])),
+            metadata={},
         )
         models.append(model)
     log.info(f"{len(models)=}")
@@ -475,7 +547,7 @@ def _build_training_dataset(
 
 
 def build_training_and_validation_datasets(
-    input_jsonl_path: str = "artifacts/summary_retriever_models.jsonl",
+    input_parquet_path: str = "artifacts/train.parquet",
     output_train_parquet_path: str = "artifacts/retriever_training/train.parquet",
     output_validation_parquet_path: str = "artifacts/retriever_training/validation.parquet",
     validation_ratio: float = 0.1,
@@ -490,13 +562,14 @@ def build_training_and_validation_datasets(
     window_start_rank: int = 5,
     window_end_rank: int = 36,
     negatives_per_row: int = 32,
-    max_concurrency: int = 64,
+    max_concurrency: int = 256,
     smoke_test: bool = False,
 ) -> None:
     """Builds train/validation datasets with hybrid-mined hard negatives.
 
     Args:
-      input_jsonl_path: Input JSONL with ``SummaryRetrieverDataModel`` rows.
+      input_parquet_path: Parquet with columns ``name``, ``markdown_content``,
+        ``summary``, ``description``, ``question`` (see ``_read_parquet``).
       output_train_parquet_path: Output path for train dataset (Parquet).
       output_validation_parquet_path: Output path for validation dataset (Parquet).
       validation_ratio: Fraction of rows allocated to validation split.
@@ -515,11 +588,11 @@ def build_training_and_validation_datasets(
       smoke_test: If True, only the first input row is processed for outputs; the
         full file is still used to resolve retrieved ids to summary/description text.
     """
-    input_path = Path(input_jsonl_path)
+    input_path = Path(input_parquet_path)
     train_path = Path(output_train_parquet_path)
     validation_path = Path(output_validation_parquet_path)
 
-    raw_rows = _read_jsonl(input_path)
+    raw_rows = _read_parquet(input_path)
     corpus_rows = _rows_to_summary_models(raw_rows)
     working_rows = corpus_rows[:1] if smoke_test else corpus_rows
     if smoke_test:
@@ -567,7 +640,12 @@ def build_training_and_validation_datasets(
 
 def main() -> None:
     """CLI entrypoint."""
-    fire.Fire({"build": build_training_and_validation_datasets})
+    fire.Fire(
+        {
+            "build": build_training_and_validation_datasets,
+            "build_retriever_training_dataset": build_training_and_validation_datasets,
+        }
+    )
 
 
 if __name__ == "__main__":
