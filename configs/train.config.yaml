@@ -18,7 +18,7 @@ output:
   dir: artifacts/sentence_transformers/qwen3-mined-negatives
 
 logging:
-  use_wandb: true
+  use_wandb: false
   project: ast-skills-retriever
   entity: ""
   run_name: qwen3-mined-negatives-train

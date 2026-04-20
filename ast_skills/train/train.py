@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -238,6 +239,28 @@ def _set_random_seed(seed: int) -> None:
     log.info(f"{seed=}")
 
 
+def _resolve_training_device() -> str:
+    """Returns a SentenceTransformers device string honoring ``CUDA_VISIBLE_DEVICES``.
+
+    ``CUDA_VISIBLE_DEVICES`` filters which physical GPUs the process may use; PyTorch
+    then exposes them as contiguous ``cuda:0``, ``cuda:1``, ... indices. The env var
+    value must not be appended to ``cuda:`` as a device index (e.g. ``0,1`` is invalid).
+    """
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    log.info(f"{cuda_visible_devices=}")
+    if not torch.cuda.is_available():
+        log.info("torch.cuda.is_available()=False; using CPU.")
+        return "cpu"
+    device_count = torch.cuda.device_count()
+    if device_count < 1:
+        log.info(f"{device_count=}; using CPU.")
+        return "cpu"
+    current = torch.cuda.current_device()
+    device_name = torch.cuda.get_device_name(current)
+    log.info(f"{device_count=}, {current=}, {device_name=}")
+    return f"cuda:{current}"
+
+
 def _build_train_examples(
     rows: list[TrainingParquetRow],
     use_hard_negatives: bool,
@@ -407,7 +430,7 @@ def train(
     seed: int = 13,
     use_hard_negatives: bool = True,
     triplet_margin: float = 0.2,
-    use_wandb: bool = True,
+    use_wandb: bool = False,
     wandb_project: str = "ast-skills-retriever",
     wandb_entity: str = "",
     run_name: str = "qwen3-parquet-train",
@@ -439,7 +462,8 @@ def train(
     examples = _build_train_examples(parsed.rows, config.use_hard_negatives)
     dataloader = _build_dataloader(examples, config.batch_size)
 
-    model = SentenceTransformer(config.base_model_name)
+    device = _resolve_training_device()
+    model = SentenceTransformer(config.base_model_name, device=device)
     train_loss = _build_loss(model, config.use_hard_negatives, config.triplet_margin)
     evaluator: SentenceEvaluator | None = None
     validation_rows = _read_parquet_rows(config.validation_parquet).rows
