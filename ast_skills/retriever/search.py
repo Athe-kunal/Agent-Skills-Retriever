@@ -47,8 +47,6 @@ class _CachedBm25(NamedTuple):
 
 
 FIELD_CONFIGS: dict[str, _FieldSearchConfig] = {
-    "what": _FieldSearchConfig("what", "what_db", "retriever_what"),
-    "why": _FieldSearchConfig("why", "why_db", "retriever_why"),
     "summary": _FieldSearchConfig("summary", "summary_db", "retriever_summary"),
     "description": _FieldSearchConfig(
         "description", "description_db", "retriever_description"
@@ -59,6 +57,18 @@ _ARTIFACTS_CACHE: dict[tuple[str, str], _SearchArtifacts] = {}
 _ARTIFACTS_CACHE_LOCK = threading.Lock()
 _BM25_CACHE: dict[str, _CachedBm25] = {}
 _BM25_CACHE_LOCK = threading.Lock()
+
+
+def _validate_field(field: str) -> str:
+    """Validates the requested retrieval field."""
+    normalized_field = field.strip().lower()
+    if normalized_field in FIELD_CONFIGS:
+        return normalized_field
+
+    supported_fields = sorted(FIELD_CONFIGS)
+    raise ValueError(
+        f"Unsupported field={field!r}. Supported fields: {supported_fields}"
+    )
 
 
 def _make_embedding_client(base_url: str, api_key: str) -> OpenAI:
@@ -152,9 +162,10 @@ def semantic_search(
     api_key: str = "EMPTY",
     limit: int = 10,
 ) -> str:
-    """Runs dense semantic search and returns JSON string."""
+    """Runs dense semantic search for summary/description and returns JSON."""
+    normalized_field = _validate_field(field=field)
     root_path = Path(root_dir)
-    artifacts = _load_artifacts(root_dir=root_path, field=field)
+    artifacts = _load_artifacts(root_dir=root_path, field=normalized_field)
     embedding_client = _make_embedding_client(base_url=embedding_base_url, api_key=api_key)
     query_response = embedding_client.embeddings.create(model=embedding_model, input=[query])
     query_embedding = query_response.data[0].embedding
@@ -181,7 +192,7 @@ def semantic_search(
             }
         )
 
-    log.info(f"{field=}, {len(output_rows)=}")
+    log.info(f"{normalized_field=}, {len(output_rows)=}")
     return json.dumps(output_rows, ensure_ascii=False, indent=2)
 
 
@@ -191,9 +202,10 @@ def sparse_search(
     root_dir: str = "artifacts/chroma",
     limit: int = 10,
 ) -> str:
-    """Runs sparse BM25 search and returns JSON string."""
+    """Runs sparse BM25 search for summary/description and returns JSON."""
+    normalized_field = _validate_field(field=field)
     root_path = Path(root_dir)
-    artifacts = _load_artifacts(root_dir=root_path, field=field)
+    artifacts = _load_artifacts(root_dir=root_path, field=normalized_field)
     bm25_artifacts = _load_bm25_with_cache(bm25_path=artifacts.bm25_path)
     bm25_result = bm25_search(
         index=bm25_artifacts.index,
@@ -223,7 +235,7 @@ def sparse_search(
             }
         )
 
-    log.info(f"{field=}, {len(output_rows)=}")
+    log.info(f"{normalized_field=}, {len(output_rows)=}")
     return json.dumps(output_rows, ensure_ascii=False, indent=2)
 
 
@@ -245,10 +257,11 @@ def hybrid_search(
     limit: int = 10,
     rrf_k: int = 60,
 ) -> str:
-    """Runs hybrid search via RRF over dense and sparse rankings."""
+    """Runs hybrid summary/description search via RRF over dense + sparse ranks."""
+    normalized_field = _validate_field(field=field)
     dense_json = semantic_search(
         query=query,
-        field=field,
+        field=normalized_field,
         root_dir=root_dir,
         embedding_base_url=embedding_base_url,
         embedding_model=embedding_model,
@@ -257,7 +270,7 @@ def hybrid_search(
     )
     sparse_json = sparse_search(
         query=query,
-        field=field,
+        field=normalized_field,
         root_dir=root_dir,
         limit=limit,
     )
@@ -295,7 +308,7 @@ def hybrid_search(
             }
         )
 
-    log.info(f"{field=}, {len(output_rows)=}, {rrf_k=}")
+    log.info(f"{normalized_field=}, {len(output_rows)=}, {rrf_k=}")
     return json.dumps(output_rows, ensure_ascii=False, indent=2)
 
 
