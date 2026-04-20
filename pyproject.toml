@@ -26,6 +26,7 @@ dependencies = [
     "wandb>=0.22.0",
     "umap-learn>=0.5.12",
     "datasets>=4.8.4",
+    "accelerate>=1.13.0",
 ]
 
 [tool.pytest.ini_options]

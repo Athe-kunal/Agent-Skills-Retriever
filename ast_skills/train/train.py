@@ -52,7 +52,7 @@ class TrainConfig:
     evaluation_steps: int = 200
     checkpoint_save_steps: int = 200
     seed: int = 13
-    use_hard_negatives: bool = False
+    use_hard_negatives: bool = True
     triplet_margin: float = 0.2
     use_wandb: bool = True
     wandb_project: str = "ast-skills-retriever"
@@ -139,7 +139,7 @@ def _train_config_from_nested_config(config: dict[str, Any]) -> TrainConfig:
         evaluation_steps=int(training_config.get("evaluation_steps", 200)),
         checkpoint_save_steps=int(training_config.get("checkpoint_save_steps", 200)),
         seed=int(training_config.get("seed", 13)),
-        use_hard_negatives=bool(training_config.get("use_hard_negatives", False)),
+        use_hard_negatives=bool(training_config.get("use_hard_negatives", True)),
         triplet_margin=float(training_config.get("triplet_margin", 0.2)),
         use_wandb=bool(logging_config.get("use_wandb", True)),
         wandb_project=str(logging_config.get("project", "ast-skills-retriever")),
@@ -172,36 +172,16 @@ def _read_parquet_rows(train_parquet: str) -> _ParsedTrainingData:
 
 def _record_to_training_row(record: dict[str, Any]) -> TrainingParquetRow | None:
     """Converts one parquet record into a normalized training row."""
-    question = str(record.get("question", "")).strip()
+    question = str(record["question"]).strip()
 
-    positive_summary = str(record.get("positive_summary", "")).strip()
-    if not positive_summary:
-        positive_summary = str(record.get("summary", "")).strip()
+    positive_summary = str(record['summary']).strip()
 
-    if not question or not positive_summary:
-        return None
-
-    hard_negatives = _normalize_hard_negatives(record)
+    hard_negatives = record['negative_documents'].tolist()
     return TrainingParquetRow(
         question=question,
         positive_summary=positive_summary,
         hard_negatives=hard_negatives,
     )
-
-
-def _normalize_hard_negatives(record: dict[str, Any]) -> list[str]:
-    """Reads optional hard negatives from known parquet columns."""
-    candidates: list[str] = []
-    for key in ("hard_negatives", "in_batch_negatives_summary", "in_batch_negatives_descriptions"):
-        value = record.get(key, [])
-        if not isinstance(value, list):
-            continue
-        for item in value:
-            text = str(item).strip()
-            if text:
-                candidates.append(text)
-    deduplicated = list(dict.fromkeys(candidates))
-    return deduplicated
 
 
 def _build_pair_examples(rows: list[TrainingParquetRow]) -> list[InputExample]:
@@ -425,7 +405,7 @@ def train(
     evaluation_steps: int = 200,
     checkpoint_save_steps: int = 200,
     seed: int = 13,
-    use_hard_negatives: bool = False,
+    use_hard_negatives: bool = True,
     triplet_margin: float = 0.2,
     use_wandb: bool = True,
     wandb_project: str = "ast-skills-retriever",
