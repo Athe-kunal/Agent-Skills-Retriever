@@ -13,10 +13,11 @@ import pandas as pd
 import torch
 import wandb
 import yaml
+from datasets import Dataset
 from loguru import logger as log
-from sentence_transformers import InputExample, SentenceTransformer, losses
-from sentence_transformers.evaluation import SentenceEvaluator
-from torch.utils.data import DataLoader
+from sentence_transformers import SentenceTransformer, SentenceTransformerTrainer, SentenceTransformerTrainingArguments
+from sentence_transformers.sentence_transformer import losses
+from sentence_transformers.sentence_transformer.evaluation import SentenceEvaluator
 
 from ast_skills.train.datamodels import TrainingParquetRow
 
@@ -55,7 +56,11 @@ class TrainConfig:
     seed: int = 13
     use_hard_negatives: bool = True
     triplet_margin: float = 0.2
-    use_wandb: bool = True
+    gradient_accumulation_steps: int = 1
+    bf16: bool = True
+    gradient_checkpointing: bool = False
+    dataloader_num_workers: int = 0
+    use_wandb: bool = False
     wandb_project: str = "ast-skills-retriever"
     wandb_entity: str = ""
     run_name: str = "qwen3-parquet-train"
@@ -163,7 +168,13 @@ def _train_config_from_nested_config(config: dict[str, Any]) -> TrainConfig:
         seed=int(training_config.get("seed", 13)),
         use_hard_negatives=_parse_bool(training_config.get("use_hard_negatives", True), default=True),
         triplet_margin=float(training_config.get("triplet_margin", 0.2)),
-        use_wandb=_parse_bool(logging_config.get("use_wandb", True), default=True),
+        gradient_accumulation_steps=int(training_config.get("gradient_accumulation_steps", 1)),
+        bf16=_parse_bool(training_config.get("bf16", True), default=True),
+        gradient_checkpointing=_parse_bool(
+            training_config.get("gradient_checkpointing", False), default=False
+        ),
+        dataloader_num_workers=int(training_config.get("dataloader_num_workers", 0)),
+        use_wandb=_parse_bool(logging_config.get("use_wandb", False), default=False),
         wandb_project=str(logging_config.get("project", "ast-skills-retriever")),
         wandb_entity=str(logging_config.get("entity", "")),
         run_name=str(logging_config.get("run_name", "qwen3-parquet-train")),
@@ -194,12 +205,17 @@ def _read_parquet_rows(train_parquet: str) -> _ParsedTrainingData:
 
 def _record_to_training_row(record: dict[str, Any]) -> TrainingParquetRow | None:
     """Converts one parquet record into a normalized training row."""
-    question = str(record["question"]).strip()
-    positive_summary = str(record["summary"]).strip()
+    question = str(record.get("question", "")).strip()
+    positive_summary = str(record.get("summary", "")).strip()
     if not question or not positive_summary:
         return None
 
-    hard_negatives = record["negative_documents"].tolist()
+    raw_negatives = record.get("negative_documents", [])
+    if hasattr(raw_negatives, "tolist"):
+        hard_negatives = raw_negatives.tolist()
+    else:
+        hard_negatives = list(raw_negatives) if raw_negatives is not None else []
+
     return TrainingParquetRow(
         question=question,
         positive_summary=positive_summary,
@@ -207,44 +223,36 @@ def _record_to_training_row(record: dict[str, Any]) -> TrainingParquetRow | None
     )
 
 
-def _build_pair_examples(rows: list[TrainingParquetRow]) -> list[InputExample]:
-    """Builds ``InputExample(question, positive_summary)`` rows."""
-    examples = [InputExample(texts=[row.question, row.positive_summary]) for row in rows]
-    log.info(f"{len(examples)=}")
-    return examples
+def _build_hf_dataset(rows: list[TrainingParquetRow], use_hard_negatives: bool) -> Dataset:
+    """Builds a HuggingFace Dataset for SentenceTransformerTrainer.
 
-
-def _build_triplet_examples(rows: list[TrainingParquetRow]) -> list[InputExample]:
-    """Builds triplet ``InputExample(question, positive, negative)`` rows."""
-    examples: list[InputExample] = []
-    for row in rows:
-        if not row.hard_negatives:
-            continue
-        negative = row.hard_negatives[0]
-        examples.append(InputExample(texts=[row.question, row.positive_summary, negative]))
-    log.info(f"{len(examples)=}")
-    return examples
-
-
-def _build_dataloader(examples: list[InputExample], batch_size: int) -> DataLoader:
-    """Builds deterministic dataloader without sample shuffling."""
-    if len(examples) < batch_size:
-        raise ValueError("Not enough examples for one full batch; lower batch_size.")
-    dataloader = DataLoader(
-        examples,
-        batch_size=batch_size,
-        shuffle=False,
-        drop_last=True,
-    )
-    log.info(f"{batch_size=}, {len(dataloader)=}")
-    return dataloader
+    Column names ``anchor``/``positive``/``negative`` are the convention expected
+    by ``TripletLoss`` and ``MultipleNegativesRankingLoss`` in sentence-transformers v3+.
+    """
+    if use_hard_negatives:
+        valid_rows = [r for r in rows if r.hard_negatives]
+        if not valid_rows:
+            raise ValueError("use_hard_negatives=True but no rows contain hard negatives.")
+        data: dict[str, list[str]] = {
+            "anchor": [r.question for r in valid_rows],
+            "positive": [r.positive_summary for r in valid_rows],
+            "negative": [r.hard_negatives[0] for r in valid_rows],
+        }
+    else:
+        data = {
+            "anchor": [r.question for r in rows],
+            "positive": [r.positive_summary for r in rows],
+        }
+    dataset = Dataset.from_dict(data)
+    log.info(f"{len(dataset)=}, {use_hard_negatives=}")
+    return dataset
 
 
 def _build_loss(
     model: SentenceTransformer,
     use_hard_negatives: bool,
     triplet_margin: float,
-):
+) -> losses.TripletLoss | losses.MultipleNegativesRankingLoss:
     """Builds training loss, defaulting to in-batch negatives."""
     if use_hard_negatives:
         loss = losses.TripletLoss(model=model, triplet_margin=triplet_margin)
@@ -259,50 +267,6 @@ def _set_random_seed(seed: int) -> None:
     """Sets deterministic PyTorch seed."""
     torch.manual_seed(seed)
     log.info(f"{seed=}")
-
-
-def _resolve_training_device() -> str:
-    """Returns a SentenceTransformers device string honoring ``CUDA_VISIBLE_DEVICES``.
-
-    ``CUDA_VISIBLE_DEVICES`` filters which physical GPUs the process may use; PyTorch
-    then exposes them as contiguous ``cuda:0``, ``cuda:1``, ... indices. The env var
-    value must not be appended to ``cuda:`` as a device index (e.g. ``0,1`` is invalid).
-    """
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    log.info(f"{cuda_visible_devices=}")
-    if not torch.cuda.is_available():
-        log.info("torch.cuda.is_available()=False; using CPU.")
-        return "cpu"
-    device_count = torch.cuda.device_count()
-    if device_count < 1:
-        log.info(f"{device_count=}; using CPU.")
-        return "cpu"
-    current = torch.cuda.current_device()
-    device_name = torch.cuda.get_device_name(current)
-    log.info(f"{device_count=}, {current=}, {device_name=}")
-    return f"cuda:{current}"
-
-
-def _build_train_examples(
-    rows: list[TrainingParquetRow],
-    use_hard_negatives: bool,
-) -> list[InputExample]:
-    """Builds pair or triplet examples based on configuration."""
-    if use_hard_negatives:
-        examples = _build_triplet_examples(rows)
-        if not examples:
-            raise ValueError("use_hard_negatives=True but no rows contain hard negatives.")
-        return examples
-    return _build_pair_examples(rows)
-
-
-def _build_wandb_config(config: TrainConfig, row_count: int, dropped_rows: int) -> dict[str, Any]:
-    """Creates W&B config payload."""
-    payload = asdict(config)
-    payload["row_count"] = row_count
-    payload["dropped_rows"] = dropped_rows
-    log.info(f"{payload=}")
-    return payload
 
 
 def _build_retrieval_dataset(rows: list[TrainingParquetRow], split_name: str) -> _RetrievalDataset:
@@ -362,7 +326,9 @@ def _compute_validation_metrics(
         }
 
     query_embeddings = model.encode(dataset.queries, normalize_embeddings=True, convert_to_numpy=True)
-    document_embeddings = model.encode(dataset.documents, normalize_embeddings=True, convert_to_numpy=True)
+    document_embeddings = model.encode(
+        dataset.documents, normalize_embeddings=True, convert_to_numpy=True
+    )
     similarity_matrix = np.matmul(query_embeddings, document_embeddings.T)
 
     hit_at_1 = 0.0
@@ -393,6 +359,8 @@ def _compute_validation_metrics(
 class _ParquetValidationEvaluator(SentenceEvaluator):
     """Sentence-transformer evaluator for parquet-based retrieval metrics."""
 
+    primary_metric = "mrr"
+
     def __init__(self, validation_dataset: _RetrievalDataset, use_wandb: bool):
         self._validation_dataset = validation_dataset
         self._use_wandb = use_wandb
@@ -413,28 +381,52 @@ class _ParquetValidationEvaluator(SentenceEvaluator):
         return metrics["eval/mrr"]
 
 
+def _build_training_args(config: TrainConfig) -> SentenceTransformerTrainingArguments:
+    """Builds SentenceTransformerTrainingArguments from TrainConfig."""
+    effective_batch = config.batch_size * config.gradient_accumulation_steps
+    log.info(
+        f"{config.batch_size=}, {config.gradient_accumulation_steps=}, {effective_batch=}, "
+        f"{config.bf16=}, {config.gradient_checkpointing=}"
+    )
+    return SentenceTransformerTrainingArguments(
+        output_dir=config.output_dir,
+        num_train_epochs=config.epochs,
+        per_device_train_batch_size=config.batch_size,
+        learning_rate=config.learning_rate,
+        warmup_steps=config.warmup_steps,
+        eval_strategy="steps",
+        eval_steps=config.evaluation_steps,
+        save_strategy="steps",
+        save_steps=config.checkpoint_save_steps,
+        save_total_limit=2,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        bf16=config.bf16,
+        gradient_checkpointing=config.gradient_checkpointing,
+        dataloader_num_workers=config.dataloader_num_workers,
+        seed=config.seed,
+        report_to="wandb" if config.use_wandb else "none",
+        run_name=config.run_name,
+    )
+
+
 def _train_model(
     model: SentenceTransformer,
-    dataloader: DataLoader,
-    train_loss: Any,
+    train_dataset: Dataset,
+    train_loss: losses.TripletLoss | losses.MultipleNegativesRankingLoss,
     config: TrainConfig,
     evaluator: SentenceEvaluator | None,
 ) -> None:
-    """Runs sentence-transformer fit loop."""
-    model.fit(
-        train_objectives=[(dataloader, train_loss)],
-        epochs=config.epochs,
+    """Runs SentenceTransformerTrainer fit loop."""
+    training_args = _build_training_args(config)
+    trainer = SentenceTransformerTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        loss=train_loss,
         evaluator=evaluator,
-        evaluation_steps=config.evaluation_steps if evaluator is not None else 0,
-        warmup_steps=config.warmup_steps,
-        optimizer_params={"lr": config.learning_rate},
-        show_progress_bar=True,
-        output_path=config.output_dir,
-        checkpoint_path=config.output_dir,
-        checkpoint_save_steps=config.checkpoint_save_steps,
-        checkpoint_save_total_limit=2,
     )
-    model.save(config.output_dir)
+    trainer.train()
+    model.save_pretrained(config.output_dir)
     log.info(f"{config.output_dir=}")
 
 
@@ -452,6 +444,10 @@ def train(
     seed: int = 13,
     use_hard_negatives: bool = True,
     triplet_margin: float = 0.2,
+    gradient_accumulation_steps: int = 1,
+    bf16: bool = True,
+    gradient_checkpointing: bool = False,
+    dataloader_num_workers: int = 0,
     use_wandb: bool = False,
     wandb_project: str = "ast-skills-retriever",
     wandb_entity: str = "",
@@ -472,6 +468,10 @@ def train(
         seed=seed,
         use_hard_negatives=use_hard_negatives,
         triplet_margin=triplet_margin,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        bf16=bf16,
+        gradient_checkpointing=gradient_checkpointing,
+        dataloader_num_workers=dataloader_num_workers,
         use_wandb=use_wandb,
         wandb_project=wandb_project,
         wandb_entity=wandb_entity,
@@ -479,15 +479,21 @@ def train(
     )
     log.info(f"{config=}")
 
-    _set_random_seed(config.seed)
-    parsed = _read_parquet_rows(config.train_parquet)
-    examples = _build_train_examples(parsed.rows, config.use_hard_negatives)
-    dataloader = _build_dataloader(examples, config.batch_size)
+    if config.use_wandb:
+        os.environ["WANDB_PROJECT"] = config.wandb_project
+        if config.wandb_entity:
+            os.environ["WANDB_ENTITY"] = config.wandb_entity
 
-    device = _resolve_training_device()
-    model = SentenceTransformer(config.base_model_name, device=device)
+    _set_random_seed(config.seed)
+
+    parsed = _read_parquet_rows(config.train_parquet)
+    log.info(f"{len(parsed.rows)=}, {parsed.dropped_rows=}")
+
+    train_dataset = _build_hf_dataset(parsed.rows, config.use_hard_negatives)
+
+    model = SentenceTransformer(config.base_model_name)
     train_loss = _build_loss(model, config.use_hard_negatives, config.triplet_margin)
-    evaluator: SentenceEvaluator | None = None
+
     validation_rows = _read_parquet_rows(config.validation_parquet).rows
     validation_dataset = _build_retrieval_dataset(validation_rows, split_name="validation")
     evaluator = _ParquetValidationEvaluator(
@@ -495,26 +501,13 @@ def train(
         use_wandb=config.use_wandb,
     )
 
-    if config.use_wandb:
-        wandb.init(
-            project=config.wandb_project,
-            entity=config.wandb_entity or None,
-            name=config.run_name,
-            config=_build_wandb_config(config, row_count=len(parsed.rows), dropped_rows=parsed.dropped_rows),
-        )
-    try:
-        _train_model(
-            model=model,
-            dataloader=dataloader,
-            train_loss=train_loss,
-            config=config,
-            evaluator=evaluator,
-        )
-        if evaluator is not None:
-            evaluator(model=model, epoch=config.epochs, steps=-1)
-    finally:
-        if config.use_wandb:
-            wandb.finish()
+    _train_model(
+        model=model,
+        train_dataset=train_dataset,
+        train_loss=train_loss,
+        config=config,
+        evaluator=evaluator,
+    )
 
 
 def train_from_config(config_path: str = "configs/train.config.yaml") -> None:

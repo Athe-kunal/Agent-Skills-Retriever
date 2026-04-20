@@ -8,6 +8,7 @@ model:
 training:
   epochs: 3
   batch_size: 32
+  gradient_accumulation_steps: 1
   learning_rate: 2.0e-5
   warmup_steps: 200
   evaluation_steps: 200
@@ -15,6 +16,9 @@ training:
   seed: 13
   use_hard_negatives: true
   triplet_margin: 0.2
+  bf16: true
+  gradient_checkpointing: false
+  dataloader_num_workers: 4
 
 output:
   dir: artifacts/sentence_transformers/qwen3-mined-negatives
