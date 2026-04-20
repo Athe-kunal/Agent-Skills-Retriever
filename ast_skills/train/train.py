@@ -71,6 +71,27 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _parse_bool(value: Any, default: bool) -> bool:
+    """Parses YAML boolean-like values robustly."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        stripped_value = value.strip()
+        parsed_value = yaml.safe_load(stripped_value)
+        if isinstance(parsed_value, bool):
+            return parsed_value
+        normalized_value = stripped_value.lower()
+        if normalized_value in {"1", "yes", "y", "on"}:
+            return True
+        if normalized_value in {"0", "no", "n", "off"}:
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
 def _train_kwargs_from_config(config: dict[str, Any]) -> dict[str, Any]:
     """Extracts kwargs for ``train`` from config payload."""
     if _is_nested_config(config):
@@ -140,9 +161,9 @@ def _train_config_from_nested_config(config: dict[str, Any]) -> TrainConfig:
         evaluation_steps=int(training_config.get("evaluation_steps", 200)),
         checkpoint_save_steps=int(training_config.get("checkpoint_save_steps", 200)),
         seed=int(training_config.get("seed", 13)),
-        use_hard_negatives=bool(training_config.get("use_hard_negatives", True)),
+        use_hard_negatives=_parse_bool(training_config.get("use_hard_negatives", True), default=True),
         triplet_margin=float(training_config.get("triplet_margin", 0.2)),
-        use_wandb=bool(logging_config.get("use_wandb", True)),
+        use_wandb=_parse_bool(logging_config.get("use_wandb", True), default=True),
         wandb_project=str(logging_config.get("project", "ast-skills-retriever")),
         wandb_entity=str(logging_config.get("entity", "")),
         run_name=str(logging_config.get("run_name", "qwen3-parquet-train")),

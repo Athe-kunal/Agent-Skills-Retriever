@@ -12,6 +12,7 @@ hard-negative mining, and logs training/evaluation metrics to Weights & Biases.
 from __future__ import annotations
 
 import json
+import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +47,14 @@ class _HardNegativeGraph(NamedTuple):
     """Hard-negative neighbor list per training row index."""
 
     neighbors_by_index: dict[int, list[int]]
+
+
+class _TrainingBatchConfig(NamedTuple):
+    """Resolved batching values used for training."""
+
+    per_device_batch_size: int
+    global_batch_size: int
+    gradient_accumulation_steps: int
 
 
 @dataclass(frozen=True)
@@ -97,6 +106,73 @@ def _read_yaml(path: Path) -> dict:
         raise ValueError("YAML config root must be a mapping.")
     log.info(f"{path=}, {list(payload.keys())=}")
     return payload
+
+
+def _parse_bool(value: object, default: bool) -> bool:
+    """Parses truthy/falsey config values in a YAML-friendly way."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        stripped_value = value.strip()
+        parsed_value = yaml.safe_load(stripped_value)
+        if isinstance(parsed_value, bool):
+            return parsed_value
+        normalized_value = stripped_value.lower()
+        if normalized_value in {"1", "yes", "y", "on"}:
+            return True
+        if normalized_value in {"0", "no", "n", "off"}:
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
+def _resolve_training_batch_config(
+    per_device_batch_size: int,
+    requested_global_batch_size: int,
+) -> _TrainingBatchConfig:
+    """Resolves gradient accumulation steps from requested global batch size."""
+    if per_device_batch_size < 1:
+        raise ValueError("batch_size must be >= 1.")
+
+    if requested_global_batch_size < 1:
+        config = _TrainingBatchConfig(
+            per_device_batch_size=per_device_batch_size,
+            global_batch_size=per_device_batch_size,
+            gradient_accumulation_steps=1,
+        )
+        log.info(f"{config=}")
+        return config
+
+    if requested_global_batch_size <= per_device_batch_size:
+        config = _TrainingBatchConfig(
+            per_device_batch_size=per_device_batch_size,
+            global_batch_size=per_device_batch_size,
+            gradient_accumulation_steps=1,
+        )
+        log.warning(
+            "requested_global_batch_size <= batch_size; using gradient_accumulation_steps=1. "
+            f"{requested_global_batch_size=}, {per_device_batch_size=}, {config.global_batch_size=}"
+        )
+        log.info(f"{config=}")
+        return config
+
+    gradient_accumulation_steps = int(math.ceil(requested_global_batch_size / per_device_batch_size))
+    resolved_global_batch_size = per_device_batch_size * gradient_accumulation_steps
+    config = _TrainingBatchConfig(
+        per_device_batch_size=per_device_batch_size,
+        global_batch_size=resolved_global_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+    )
+    if resolved_global_batch_size != requested_global_batch_size:
+        log.warning(
+            "Requested global batch size is not divisible by per-device batch size; "
+            f"{requested_global_batch_size=}, {resolved_global_batch_size=}"
+        )
+    log.info(f"{config=}")
+    return config
 
 
 def _load_summary_rows_from_jsonl(dataset_jsonl: str) -> list[SummaryRetrieverDataModel]:
@@ -154,11 +230,12 @@ def _train_kwargs_from_nested_config(config: dict) -> dict:
         "base_model_name": str(model_config.get("name", "Qwen/Qwen3-Embedding-0.6B")),
         "epochs": int(training_config.get("epochs", 3)),
         "batch_size": int(training_config.get("batch_size", 32)),
+        "global_batch_size": int(training_config.get("global_batch_size", 0)),
         "learning_rate": float(training_config.get("learning_rate", 2e-5)),
         "warmup_steps": int(training_config.get("warmup_steps", 200)),
         "seed": int(training_config.get("seed", 13)),
         "output_dir": str(output_config.get("dir", "artifacts/sentence_transformers/qwen3-summary")),
-        "use_wandb": bool(logging_config.get("use_wandb", True)),
+        "use_wandb": _parse_bool(logging_config.get("use_wandb", True), default=True),
         "wandb_project": str(logging_config.get("project", "ast-skills-retriever")),
         "wandb_entity": str(logging_config.get("entity", "")),
         "run_name": str(logging_config.get("run_name", "qwen3-summary-train")),
@@ -588,6 +665,7 @@ def train(
     base_model_name: str = "Qwen/Qwen3-Embedding-0.6B",
     epochs: int = 3,
     batch_size: int = 32,
+    global_batch_size: int = 0,
     learning_rate: float = 2e-5,
     warmup_steps: int = 200,
     seed: int = 13,
@@ -612,7 +690,9 @@ def train(
       output_dir: Output path for checkpoints and final model.
       base_model_name: Sentence-transformers model name/path.
       epochs: Number of epochs.
-      batch_size: Training batch size.
+      batch_size: Per-device training batch size.
+      global_batch_size: Effective global batch size target. Set ``<=0`` to disable
+        gradient accumulation and use ``batch_size`` directly.
       learning_rate: Optimizer learning rate.
       warmup_steps: Warmup steps per epoch-run.
       seed: Random seed.
@@ -636,6 +716,10 @@ def train(
         mined_parquet_path=mined_parquet_path,
     )
     st_model = SentenceTransformer(base_model_name)
+    batch_config = _resolve_training_batch_config(
+        per_device_batch_size=batch_size,
+        requested_global_batch_size=global_batch_size,
+    )
 
     mining_config = _MiningConfig(
         backend=mining_backend,
@@ -651,7 +735,7 @@ def train(
         dataset_jsonl=dataset_jsonl,
         base_model_name=base_model_name,
         epochs=epochs,
-        batch_size=batch_size,
+        batch_size=batch_config.per_device_batch_size,
         learning_rate=learning_rate,
         warmup_steps=warmup_steps,
         seed=seed,
@@ -660,6 +744,8 @@ def train(
         train_config_path=train_config_path,
         train_config_payload=train_config_payload,
     )
+    wandb_config["global_batch_size"] = batch_config.global_batch_size
+    wandb_config["gradient_accumulation_steps"] = batch_config.gradient_accumulation_steps
 
     evaluator: WandbRetrievalEvaluator | None = None
     run = None
@@ -695,7 +781,7 @@ def train(
         dataset = _flatten_batches_to_dataset(batches=batches, examples=examples)
         train_dataloader = DataLoader(
             dataset,
-            batch_size=batch_size,
+            batch_size=batch_config.per_device_batch_size,
             shuffle=False,
             drop_last=True,
         )
@@ -713,6 +799,7 @@ def train(
                 output_path=output_dir,
                 checkpoint_path=output_dir,
                 checkpoint_save_total_limit=2,
+                gradient_accumulation_steps=batch_config.gradient_accumulation_steps,
             )
         else:
             st_model.fit(
@@ -724,6 +811,7 @@ def train(
                 output_path=output_dir,
                 checkpoint_path=output_dir,
                 checkpoint_save_total_limit=2,
+                gradient_accumulation_steps=batch_config.gradient_accumulation_steps,
             )
         if run is not None:
             run.log({"train/epoch": epoch_index + 1, "train/examples": len(dataset)})

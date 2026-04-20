@@ -61,9 +61,14 @@ The training config is split into sections:
 - `input.mined_parquet_path`
 - `input.validation_parquet_path` (optional validation metrics dataset)
 - `model.name`
-- `training.{epochs,batch_size,learning_rate,warmup_steps,evaluation_steps,checkpoint_save_steps,seed}`
+- `training.{epochs,batch_size,global_batch_size,learning_rate,warmup_steps,evaluation_steps,checkpoint_save_steps,seed}`
 - `output.dir`
 - `logging.use_wandb` (default `true`) plus optional W&B metadata
+
+`batch_size` is per-device batch size. If `global_batch_size` is greater than
+`batch_size`, gradient accumulation is enabled automatically with:
+
+`gradient_accumulation_steps = ceil(global_batch_size / batch_size)`
 
 Default config files:
 - `configs/train.config.yaml`
