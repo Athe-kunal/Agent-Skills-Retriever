@@ -1,3 +1,5 @@
+"""Public data models for the ``ast_skills.train`` package."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -29,14 +31,19 @@ class DataPoint:
     question: str
 
 
-@dataclass()
+@dataclass(frozen=True)
 class SeedQuestionsTrainingData:
+    """One row with negatives sampled against description and summary fields."""
+
     question: str
     in_batch_negatives_question_wrt_descriptions: list[str]
     in_batch_negatives_question_wrt_summaries: list[str]
 
-@dataclass()
+
+@dataclass(frozen=True)
 class ValidatedTrainingData:
+    """Row used during validated question generation and filtering."""
+
     custom_id: str
     name: str
     markdown_content: str
@@ -59,3 +66,11 @@ class MinedTrainingDataRow:
     negative_summaries: list[str]
     negative_descriptions: list[str] | None = None
 
+
+@dataclass(frozen=True)
+class TrainingParquetRow:
+    """Normalized parquet row used by sentence-transformer training."""
+
+    question: str
+    positive_summary: str
+    hard_negatives: list[str]

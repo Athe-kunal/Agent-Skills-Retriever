@@ -1,138 +1,69 @@
 # AST-Based-Agent-Skills Retriever Training
 
-This repository now includes retriever training and evaluation scripts for summary-based
-skill retrieval using Sentence Transformers.
+This repo supports a 3-step retriever workflow:
 
-## What you need before training
+1. Build Chroma indexes for `summary` + `description`.
+2. Mine negatives parquet using rank window **top-37 minus top-5** (ranks 6..37).
+3. Train from the mined negatives parquet.
 
-### 1) Python dependencies
-Install project dependencies with `uv`:
+## Prerequisites
 
 ```bash
 uv sync
 ```
 
-### 2) Training dataset JSONL
-Prepare a JSONL file with rows matching `SummaryRetrieverDataModel`:
-
-```python
-@dataclass(frozen=True)
-class SummaryRetrieverDataModel:
-    custom_id: str
-    markdown_content: str
-    seed_questions: list[str]
-    summary: str
-    name: str
-    description: str
-    metadata: dict[str, str]
-```
-
-Set fields in `configs/train.yaml` (`train.dataset_jsonl` and
-`evaluate.dataset_jsonl`).
-
-### 3) Weights & Biases setup
-Training and evaluation both log metrics to W&B.
-
-1. Create/login to a W&B account.
-2. Authenticate locally:
+Optional for training metrics:
 
 ```bash
 uv run wandb login
 ```
 
-3. Optionally set these in your shell:
+## Workflow
+
+### Step 1: Build Chroma (summary + description)
 
 ```bash
-export WANDB_PROJECT=ast-skills-retriever
-export WANDB_ENTITY=your_entity
+make build-retriever-chroma
 ```
 
-### 4) Model and hardware
-- Default base model: `Qwen/Qwen3-Embedding-0.6B`.
-- Ensure sufficient GPU memory for your chosen model and batch size.
-- For vLLM-based evaluation, start an embeddings endpoint (see Make targets below).
+Defaults:
+- source JSONL: `artifacts/summary_retriever_models.jsonl`
+- output Chroma root: `artifacts/chroma`
+- fields: `summary,description`
 
-## Makefile commands
-
-### Serve vLLM embeddings endpoint (optional)
+### Step 2: Mine negatives parquet (top-37 minus top-5)
 
 ```bash
-make vllm-embd-serve
+make build-mined-negatives-parquet
 ```
 
-### Training/evaluation config file
+This uses:
+- `top_k=37`
+- `window_start_rank=6`
+- `window_end_rank=37`
 
-All hyperparameters and runtime settings now live in:
+Output files:
+- `artifacts/retriever_training/train.parquet`
+- `artifacts/retriever_training/validation.parquet`
 
-```text
-configs/train.yaml
-```
-
-This file includes:
-- model names
-- dataset paths
-- optimizer/training hyperparameters
-- backend selection (`bi_encoder`, `late_interaction`, `vllm`)
-- optional query/document instructions
-- W&B metadata
-
-During training, this YAML payload is forwarded into W&B config so runs are tied
-to the exact committed config file.
-
-### Train retriever model
+### Step 3: Train from mined parquet
 
 ```bash
 make retriever-train
 ```
 
-Train with an alternate config path:
+By default this reads `configs/train.config.yaml`.
 
-```bash
-make retriever-train \
-  TRAIN_CONFIG_PATH=configs/train.yaml
-```
+## Training config
 
-### Evaluate retriever model
+The training config is split into sections:
 
-```bash
-make retriever-evaluate
-```
+- `input.mined_parquet_path`
+- `model.name`
+- `training.{epochs,batch_size,learning_rate,warmup_steps,seed}`
+- `output.dir`
+- `logging.use_wandb` (default `true`) plus optional W&B metadata
 
-Evaluate with an alternate config path:
-
-```bash
-make retriever-evaluate \
-  EVAL_CONFIG_PATH=configs/train.yaml
-```
-
-## Metrics logged
-
-Both training-time and standalone evaluation log:
-- `eval/hit_at_1`
-- `eval/hit_at_3`
-- `eval/hit_at_5`
-- `eval/mrr`
-- `eval/queries`
-
-Training additionally logs per-epoch train counts.
-
-
-## Scenario-driven prompt generation
-
-A dedicated module now exists at `ast_skills/persona_data_gen` for creating prompts used in
-scenario-driven retrieval evaluation:
-
-- `scenario_prompts.py`: prompt template to generate **5 scenario + question pairs** from one
-  SKILL.md.
-- `prompt_jobs.py`: CLI jobs that reuse the shared SKILL.md collection and token-budget
-  filtering from `ast_skills.data_gen.skills_data_collect.collect_english_skill_md_records`.
-
-Example usage:
-
-```bash
-uv run python -m ast_skills.persona_data_gen.prompt_jobs build_scenario_prompts \
-  --skills_root skills/skills --output_dir outputs/scenario_batch_inputs
-```
-
-Batch input shards are written under ``output_dir`` as numbered files:
-``scenario_generation_batch_1.jsonl``, ``scenario_generation_batch_2.jsonl``, …
+Default config files:
+- `configs/train.config.yaml`
+- `configs/train.yaml` (same content, compatibility copy)

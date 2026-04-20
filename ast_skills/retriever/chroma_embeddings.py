@@ -35,16 +35,6 @@ class _CollectionPayload(NamedTuple):
 
 FIELD_CONFIGS: tuple[_FieldBuildConfig, ...] = (
     _FieldBuildConfig(
-        field_name="what",
-        db_dir_name="what_db",
-        collection_name="retriever_what",
-    ),
-    _FieldBuildConfig(
-        field_name="why",
-        db_dir_name="why_db",
-        collection_name="retriever_why",
-    ),
-    _FieldBuildConfig(
         field_name="summary",
         db_dir_name="summary_db",
         collection_name="retriever_summary",
@@ -55,6 +45,19 @@ FIELD_CONFIGS: tuple[_FieldBuildConfig, ...] = (
         collection_name="retriever_description",
     ),
 )
+
+
+def _parse_field_filter(only_fields: str) -> set[str]:
+    """Parses and validates the optional field filter."""
+    field_filter = {field.strip() for field in only_fields.split(",") if field.strip()}
+    supported_fields = {config.field_name for config in FIELD_CONFIGS}
+    invalid_fields = sorted(field_filter - supported_fields)
+    if invalid_fields:
+        raise ValueError(
+            f"Unsupported fields in only_fields: {invalid_fields}. "
+            f"Supported fields: {sorted(supported_fields)}"
+        )
+    return field_filter
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -85,10 +88,6 @@ def _rows_to_models(rows: list[dict[str, Any]]) -> list[RetrieverDataModel]:
 
         model = RetrieverDataModel(
             custom_id=str(row.get("custom_id", "")),
-            markdown_content=str(row.get("markdown_content", "")),
-            reasoning=str(row.get("reasoning", "")),
-            what=str(row.get("what", "")),
-            why=str(row.get("why", "")),
             seed_questions=[str(question) for question in seed_questions],
             name=str(row.get("name", "")),
             description=str(row.get("description", "")),
@@ -242,10 +241,11 @@ def build_chroma_databases(
     embedding_batch_size: int = 4096,
     only_fields: str = "",
 ) -> None:
-    """Builds ChromaDB databases for what/why/summary/description fields.
+    """Builds ChromaDB databases for summary/description fields.
 
     ``only_fields`` is an optional comma-separated list of field names to build
-    (e.g. ``"summary"`` or ``"what,summary"``). When empty, all fields are built.
+    (e.g. ``"summary"`` or ``"summary,description"``). When empty, all fields are
+    built.
     """
     input_jsonl = Path(input_jsonl_path)
     output_root = Path(output_root_dir)
@@ -254,8 +254,12 @@ def build_chroma_databases(
         f"{embedding_model=}, {embedding_batch_size=}, {only_fields=}"
     )
 
-    field_filter = {f.strip() for f in only_fields.split(",") if f.strip()}
-    active_configs = [c for c in FIELD_CONFIGS if not field_filter or c.field_name in field_filter]
+    field_filter = _parse_field_filter(only_fields=only_fields)
+    active_configs = [
+        config
+        for config in FIELD_CONFIGS
+        if not field_filter or config.field_name in field_filter
+    ]
     log.info(f"{field_filter=}, building fields: {[c.field_name for c in active_configs]}")
 
     rows = _read_jsonl(input_jsonl)

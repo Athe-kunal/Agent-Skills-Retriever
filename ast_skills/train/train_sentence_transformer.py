@@ -19,6 +19,7 @@ from typing import NamedTuple, Sequence
 
 import fire
 import numpy as np
+import pandas as pd
 import torch
 import wandb
 import yaml
@@ -98,12 +99,81 @@ def _read_yaml(path: Path) -> dict:
     return payload
 
 
-def _load_summary_rows(dataset_jsonl: str) -> list[SummaryRetrieverDataModel]:
+def _load_summary_rows_from_jsonl(dataset_jsonl: str) -> list[SummaryRetrieverDataModel]:
     """Loads summary dataset rows from JSONL."""
     raw_rows = _read_jsonl(Path(dataset_jsonl))
     models = [SummaryRetrieverDataModel(**row) for row in raw_rows]
     log.info(f"{len(models)=}")
     return models
+
+
+def _load_summary_rows_from_parquet(mined_parquet_path: str) -> list[SummaryRetrieverDataModel]:
+    """Loads summary-style training rows from mined negatives parquet."""
+    dataframe = pd.read_parquet(mined_parquet_path)
+    models: list[SummaryRetrieverDataModel] = []
+    for row_index, row in dataframe.iterrows():
+        question = str(row.get("question", "")).strip()
+        summary = str(row.get("summary", "")).strip()
+        description = str(row.get("description", "")).strip()
+        name = str(row.get("name", "")).strip() or f"row-{row_index}"
+        if not question or not (summary or description):
+            continue
+        models.append(
+            SummaryRetrieverDataModel(
+                custom_id=str(row_index),
+                markdown_content="",
+                seed_questions=[question],
+                summary=summary,
+                name=name,
+                description=description,
+                metadata={},
+            )
+        )
+    log.info(f"{mined_parquet_path=}, {len(models)=}")
+    return models
+
+
+def _load_summary_rows(dataset_jsonl: str = "", mined_parquet_path: str = "") -> list[SummaryRetrieverDataModel]:
+    """Loads summary dataset rows from JSONL or mined-negatives parquet."""
+    if mined_parquet_path.strip():
+        return _load_summary_rows_from_parquet(mined_parquet_path=mined_parquet_path)
+    if dataset_jsonl.strip():
+        return _load_summary_rows_from_jsonl(dataset_jsonl=dataset_jsonl)
+    raise ValueError("Either dataset_jsonl or mined_parquet_path must be provided.")
+
+
+def _train_kwargs_from_nested_config(config: dict) -> dict:
+    """Builds train kwargs from nested YAML config sections."""
+    input_config = dict(config.get("input", {}))
+    model_config = dict(config.get("model", {}))
+    training_config = dict(config.get("training", {}))
+    output_config = dict(config.get("output", {}))
+    logging_config = dict(config.get("logging", {}))
+    kwargs = {
+        "mined_parquet_path": str(input_config.get("mined_parquet_path", "")),
+        "base_model_name": str(model_config.get("name", "Qwen/Qwen3-Embedding-0.6B")),
+        "epochs": int(training_config.get("epochs", 3)),
+        "batch_size": int(training_config.get("batch_size", 32)),
+        "learning_rate": float(training_config.get("learning_rate", 2e-5)),
+        "warmup_steps": int(training_config.get("warmup_steps", 200)),
+        "seed": int(training_config.get("seed", 13)),
+        "output_dir": str(output_config.get("dir", "artifacts/sentence_transformers/qwen3-summary")),
+        "use_wandb": bool(logging_config.get("use_wandb", True)),
+        "wandb_project": str(logging_config.get("project", "ast-skills-retriever")),
+        "wandb_entity": str(logging_config.get("entity", "")),
+        "run_name": str(logging_config.get("run_name", "qwen3-summary-train")),
+    }
+    log.info(f"{kwargs=}")
+    return kwargs
+
+
+def _train_kwargs_from_legacy_config(config: dict) -> dict:
+    """Builds train kwargs from legacy flat `train` section."""
+    train_config = config.get("train", {})
+    if not isinstance(train_config, dict):
+        raise ValueError("`train` section must be a mapping.")
+    kwargs = dict(train_config)
+    return kwargs
 
 
 def _apply_instruction(text: str, instruction: str) -> str:
@@ -503,16 +573,17 @@ def _train_kwargs_from_config(config: dict) -> dict:
       train:
         ...
     """
-    train_config = config.get("train", {})
-    if not isinstance(train_config, dict):
-        raise ValueError("`train` section must be a mapping.")
-    kwargs = dict(train_config)
+    if isinstance(config.get("train"), dict):
+        kwargs = _train_kwargs_from_legacy_config(config)
+    else:
+        kwargs = _train_kwargs_from_nested_config(config)
     log.info(f"{kwargs=}")
     return kwargs
 
 
 def train(
-    dataset_jsonl: str,
+    dataset_jsonl: str = "",
+    mined_parquet_path: str = "",
     output_dir: str = "artifacts/sentence_transformers/qwen3-summary",
     base_model_name: str = "Qwen/Qwen3-Embedding-0.6B",
     epochs: int = 3,
@@ -530,6 +601,7 @@ def train(
     wandb_project: str = "ast-skills-retriever",
     wandb_entity: str = "",
     run_name: str = "qwen3-summary-train",
+    use_wandb: bool = True,
     train_config_path: str = "",
     train_config_payload: dict[str, object] | None = None,
 ) -> None:
@@ -559,7 +631,10 @@ def train(
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    models = _load_summary_rows(dataset_jsonl=dataset_jsonl)
+    models = _load_summary_rows(
+        dataset_jsonl=dataset_jsonl,
+        mined_parquet_path=mined_parquet_path,
+    )
     st_model = SentenceTransformer(base_model_name)
 
     mining_config = _MiningConfig(
@@ -586,17 +661,19 @@ def train(
         train_config_payload=train_config_payload,
     )
 
-    wandb.init(
-        project=wandb_project,
-        entity=wandb_entity or None,
-        name=run_name,
-        config=wandb_config,
-    )
-    run = wandb.run
-    if run is None:
-        raise RuntimeError("wandb.run was None after wandb.init.")
-
-    evaluator = WandbRetrievalEvaluator(models=models, run=run, config=eval_config)
+    evaluator: WandbRetrievalEvaluator | None = None
+    run = None
+    if use_wandb:
+        wandb.init(
+            project=wandb_project,
+            entity=wandb_entity or None,
+            name=run_name,
+            config=wandb_config,
+        )
+        run = wandb.run
+        if run is None:
+            raise RuntimeError("wandb.run was None after wandb.init.")
+        evaluator = WandbRetrievalEvaluator(models=models, run=run, config=eval_config)
 
     for epoch_index in range(epochs):
         epoch_rng = random.Random(seed + epoch_index)
@@ -625,25 +702,39 @@ def train(
         train_loss = losses.MultipleNegativesRankingLoss(st_model)
 
         log.info(f"{epoch_index=}, {len(dataset)=}, {len(batches)=}")
-        st_model.fit(
-            train_objectives=[(train_dataloader, train_loss)],
-            evaluator=evaluator,
-            epochs=1,
-            warmup_steps=warmup_steps,
-            optimizer_params={"lr": learning_rate},
-            show_progress_bar=True,
-            output_path=output_dir,
-            checkpoint_path=output_dir,
-            checkpoint_save_total_limit=2,
-        )
-        run.log({"train/epoch": epoch_index + 1, "train/examples": len(dataset)})
+        if evaluator is not None:
+            st_model.fit(
+                train_objectives=[(train_dataloader, train_loss)],
+                evaluator=evaluator,
+                epochs=1,
+                warmup_steps=warmup_steps,
+                optimizer_params={"lr": learning_rate},
+                show_progress_bar=True,
+                output_path=output_dir,
+                checkpoint_path=output_dir,
+                checkpoint_save_total_limit=2,
+            )
+        else:
+            st_model.fit(
+                train_objectives=[(train_dataloader, train_loss)],
+                epochs=1,
+                warmup_steps=warmup_steps,
+                optimizer_params={"lr": learning_rate},
+                show_progress_bar=True,
+                output_path=output_dir,
+                checkpoint_path=output_dir,
+                checkpoint_save_total_limit=2,
+            )
+        if run is not None:
+            run.log({"train/epoch": epoch_index + 1, "train/examples": len(dataset)})
 
     st_model.save(output_dir)
     log.info(f"{output_dir=}")
-    wandb.finish()
+    if use_wandb:
+        wandb.finish()
 
 
-def train_from_config(config_path: str = "configs/train.yaml") -> None:
+def train_from_config(config_path: str = "configs/train.config.yaml") -> None:
     """Loads YAML config and runs training.
 
     Args:
