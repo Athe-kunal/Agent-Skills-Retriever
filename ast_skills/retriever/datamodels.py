@@ -7,13 +7,9 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class RetrieverDataModel:
-    """One retriever training row plus structured extraction fields."""
+    """One retriever training row used for summary/description indexing."""
 
     custom_id: str
-    markdown_content: str
-    reasoning: str
-    what: str
-    why: str
     seed_questions: list[str]
     name: str
     description: str
