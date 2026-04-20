@@ -195,10 +195,11 @@ def _read_parquet_rows(train_parquet: str) -> _ParsedTrainingData:
 def _record_to_training_row(record: dict[str, Any]) -> TrainingParquetRow | None:
     """Converts one parquet record into a normalized training row."""
     question = str(record["question"]).strip()
+    positive_summary = str(record["summary"]).strip()
+    if not question or not positive_summary:
+        return None
 
-    positive_summary = str(record['summary']).strip()
-
-    hard_negatives = record['negative_documents'].tolist()
+    hard_negatives = record["negative_documents"].tolist()
     return TrainingParquetRow(
         question=question,
         positive_summary=positive_summary,
