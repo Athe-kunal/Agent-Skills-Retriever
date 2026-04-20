@@ -263,32 +263,24 @@ def _split_rows(
     return _DatasetSplit(train_rows=train_rows, validation_rows=validation_rows)
 
 
-def _pick_question(seed_questions: list[str], rng: random.Random) -> str:
-    """Picks one random non-empty seed question."""
-    candidates = [
-        question.strip() for question in seed_questions if question and question.strip()
-    ]
-    if not candidates:
-        return ""
-    return rng.choice(candidates)
+def _pick_question(seed_questions: list[str]) -> str:
+    """Returns the first non-empty seed question."""
+    for question in seed_questions:
+        if question and question.strip():
+            return question.strip()
+    return ""
 
 
-def _pick_row_query(row: SummaryRetrieverDataModel, rng: random.Random) -> str:
-    """Picks a non-empty query from seed questions, else from name/summary/description."""
-    question = _pick_question(row.seed_questions, rng)
+def _pick_row_query(row: SummaryRetrieverDataModel) -> str:
+    """Returns first non-empty question from seed questions, else first of name/summary/description."""
+    question = _pick_question(row.seed_questions)
     if question:
         return question
-    fallbacks = [
-        text.strip()
-        for text in (row.name, row.summary, row.description)
-        if text and text.strip()
-    ]
-    if not fallbacks:
-        log.warning(
-            f"No non-empty seed questions or fallback text for {row.custom_id=}"
-        )
-        return ""
-    return rng.choice(fallbacks)
+    for text in (row.name, row.summary, row.description):
+        if text and text.strip():
+            return text.strip()
+    log.warning(f"No non-empty seed questions or fallback text for {row.custom_id=}")
+    return ""
 
 
 def _build_negative_lookup(
@@ -457,15 +449,18 @@ def _mine_field_negatives(
         bm25_cache=bm25_cache,
     )
 
+    positive_text = lookup_by_custom_id.get(positive_custom_id, "").strip()
     non_positive_ids = [cid for cid in ranked_ids if cid != positive_custom_id]
     candidate_ids = non_positive_ids[window_config.window_start_rank - 1:]
 
+    seen_texts: set[str] = {positive_text} if positive_text else set()
     negatives: list[str] = []
     for candidate_id in candidate_ids:
         text = lookup_by_custom_id.get(candidate_id, "").strip()
-        if text:
+        if text and text not in seen_texts:
+            seen_texts.add(text)
             negatives.append(text)
-        if len(negatives) >= window_config.negatives_per_row:
+        if len(negatives) > window_config.negatives_per_row:
             break
 
     log.info(f"{field=}, {len(negatives)=}")
@@ -474,18 +469,30 @@ def _mine_field_negatives(
 
 def _build_row_questions(
     rows: list[SummaryRetrieverDataModel],
-    question_pick_seed: int,
 ) -> list[_RowQuestion]:
     """Pre-computes one question per row before asynchronous execution."""
-    question_rng = random.Random(question_pick_seed)
     row_questions: list[_RowQuestion] = []
     for row_index, row in enumerate(rows):
-        question = _pick_row_query(row, question_rng)
+        question = _pick_row_query(row)
         row_questions.append(
             _RowQuestion(row_index=row_index, row=row, question=question)
         )
     log.info(f"{len(row_questions)=}")
     return row_questions
+
+
+def _deduplicate_training_rows(rows: list[TrainingData]) -> list[TrainingData]:
+    """Deduplicates training rows by (name, question), keeping first occurrence."""
+    seen: set[tuple[str, str]] = set()
+    unique_rows: list[TrainingData] = []
+    for row in rows:
+        key = (row.name, row.question)
+        if key not in seen:
+            seen.add(key)
+            unique_rows.append(row)
+    duplicates_removed = len(rows) - len(unique_rows)
+    log.info(f"{len(unique_rows)=}, {duplicates_removed=}")
+    return unique_rows
 
 
 async def _mine_field_negatives_async(
@@ -561,7 +568,6 @@ async def _build_training_dataset_async(
     all_rows: list[SummaryRetrieverDataModel],
     hybrid_config: _HybridSearchConfig,
     window_config: _NegativeWindowConfig,
-    question_pick_seed: int,
     max_concurrency: int,
     embedding_batch_size: int,
     split_name: str = "split",
@@ -572,12 +578,13 @@ async def _build_training_dataset_async(
       1. Batch embed all questions (GPU-saturating).
       2. Batch BM25 all (question, "summary") pairs in parallel (CPU-parallel).
       3. ChromaDB ANN lookup + RRF merge per row (async concurrent).
+      4. Deduplicate by (name, question).
     """
     if max_concurrency < 1:
         raise ValueError("max_concurrency must be >= 1.")
 
     lookup = _build_negative_lookup(all_rows)
-    row_questions = _build_row_questions(rows=rows, question_pick_seed=question_pick_seed)
+    row_questions = _build_row_questions(rows=rows)
 
     all_questions = [rq.question for rq in row_questions]
     embedding_cache = await asyncio.to_thread(
@@ -617,8 +624,9 @@ async def _build_training_dataset_async(
         *tasks, desc=f"Mining negatives [{split_name}]"
     )
     output_rows = [row for row in training_rows_or_none if row is not None]
-    log.info(f"{max_concurrency=}, {len(output_rows)=}")
-    return output_rows
+    deduplicated_rows = _deduplicate_training_rows(output_rows)
+    log.info(f"{max_concurrency=}, {len(deduplicated_rows)=}")
+    return deduplicated_rows
 
 
 def _build_training_dataset(
@@ -626,7 +634,6 @@ def _build_training_dataset(
     all_rows: list[SummaryRetrieverDataModel],
     hybrid_config: _HybridSearchConfig,
     window_config: _NegativeWindowConfig,
-    question_pick_seed: int,
     max_concurrency: int,
     embedding_batch_size: int,
     split_name: str = "split",
@@ -638,7 +645,6 @@ def _build_training_dataset(
             all_rows=all_rows,
             hybrid_config=hybrid_config,
             window_config=window_config,
-            question_pick_seed=question_pick_seed,
             max_concurrency=max_concurrency,
             embedding_batch_size=embedding_batch_size,
             split_name=split_name,
@@ -652,7 +658,6 @@ def build_training_and_validation_datasets(
     output_validation_parquet_path: str = "artifacts/retriever_training/validation.parquet",
     validation_ratio: float = 0.1,
     random_seed: int = 13,
-    question_pick_seed: int = 42,
     chroma_root_dir: str = "artifacts/chroma",
     embedding_base_url: str = "http://127.0.0.1:8000/v1",
     embedding_model: str = "Qwen/Qwen3-Embedding-8B",
@@ -674,7 +679,6 @@ def build_training_and_validation_datasets(
       output_validation_parquet_path: Output path for validation dataset (Parquet).
       validation_ratio: Fraction of rows allocated to validation split.
       random_seed: Seed for train/validation split shuffling.
-      question_pick_seed: Seed for randomly choosing one ``seed_question`` per row.
       chroma_root_dir: Root directory containing Chroma and BM25 artifacts.
       embedding_base_url: OpenAI-compatible embedding endpoint.
       embedding_model: Embedding model used for dense query encoding.
@@ -722,7 +726,6 @@ def build_training_and_validation_datasets(
         all_rows=corpus_rows,
         hybrid_config=hybrid_config,
         window_config=window_config,
-        question_pick_seed=question_pick_seed,
         max_concurrency=max_concurrency,
         embedding_batch_size=embedding_batch_size,
         split_name="train",
@@ -732,7 +735,6 @@ def build_training_and_validation_datasets(
         all_rows=corpus_rows,
         hybrid_config=hybrid_config,
         window_config=window_config,
-        question_pick_seed=question_pick_seed,
         max_concurrency=max_concurrency,
         embedding_batch_size=embedding_batch_size,
         split_name="validation",
