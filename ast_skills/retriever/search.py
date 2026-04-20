@@ -12,8 +12,9 @@ import chromadb
 import fire
 from loguru import logger as log
 from openai import OpenAI
+from rank_bm25 import BM25Okapi
 
-from ast_skills.retriever.bm25_index import bm25_search, load_bm25_index
+from ast_skills.retriever.bm25_index import bm25_search, load_bm25_artifacts
 
 
 class _FieldSearchConfig(NamedTuple):
@@ -38,6 +39,13 @@ class _SearchArtifacts(NamedTuple):
     bm25_path: Path
 
 
+class _CachedBm25(NamedTuple):
+    """Cached sparse index and BM25 model."""
+
+    index: Any
+    model: BM25Okapi
+
+
 FIELD_CONFIGS: dict[str, _FieldSearchConfig] = {
     "what": _FieldSearchConfig("what", "what_db", "retriever_what"),
     "why": _FieldSearchConfig("why", "why_db", "retriever_why"),
@@ -49,6 +57,8 @@ FIELD_CONFIGS: dict[str, _FieldSearchConfig] = {
 
 _ARTIFACTS_CACHE: dict[tuple[str, str], _SearchArtifacts] = {}
 _ARTIFACTS_CACHE_LOCK = threading.Lock()
+_BM25_CACHE: dict[str, _CachedBm25] = {}
+_BM25_CACHE_LOCK = threading.Lock()
 
 
 def _make_embedding_client(base_url: str, api_key: str) -> OpenAI:
@@ -111,6 +121,28 @@ def _load_artifacts(root_dir: Path, field: str) -> _SearchArtifacts:
     return loaded_artifacts
 
 
+def _load_bm25_with_cache(bm25_path: Path) -> _CachedBm25:
+    """Loads BM25 payload/model with in-process cache to avoid rebuild per query."""
+    cache_key = str(bm25_path.resolve())
+    with _BM25_CACHE_LOCK:
+        cached_bm25 = _BM25_CACHE.get(cache_key)
+        if cached_bm25 is not None:
+            return cached_bm25
+
+    loaded = load_bm25_artifacts(path=bm25_path)
+    cached_bm25 = _CachedBm25(
+        index=loaded.index,
+        model=loaded.model,
+    )
+    with _BM25_CACHE_LOCK:
+        existing_bm25 = _BM25_CACHE.get(cache_key)
+        if existing_bm25 is not None:
+            return existing_bm25
+        _BM25_CACHE[cache_key] = cached_bm25
+    log.info(f"{cache_key=}, {len(cached_bm25.index.ids)=}, loaded_from_cache=False")
+    return cached_bm25
+
+
 def semantic_search(
     query: str,
     field: str = "description",
@@ -162,16 +194,21 @@ def sparse_search(
     """Runs sparse BM25 search and returns JSON string."""
     root_path = Path(root_dir)
     artifacts = _load_artifacts(root_dir=root_path, field=field)
-    bm25_index = load_bm25_index(artifacts.bm25_path)
-    bm25_result = bm25_search(index=bm25_index, query=query, limit=limit)
+    bm25_artifacts = _load_bm25_with_cache(bm25_path=artifacts.bm25_path)
+    bm25_result = bm25_search(
+        index=bm25_artifacts.index,
+        query=query,
+        limit=limit,
+        model=bm25_artifacts.model,
+    )
 
     metadata_by_id = {
-        row_id: bm25_index.metadatas[index]
-        for index, row_id in enumerate(bm25_index.ids)
+        row_id: bm25_artifacts.index.metadatas[index]
+        for index, row_id in enumerate(bm25_artifacts.index.ids)
     }
     document_by_id = {
-        row_id: bm25_index.documents[index]
-        for index, row_id in enumerate(bm25_index.ids)
+        row_id: bm25_artifacts.index.documents[index]
+        for index, row_id in enumerate(bm25_artifacts.index.ids)
     }
 
     output_rows = []
