@@ -239,12 +239,190 @@ def sparse_search(
     return json.dumps(output_rows, ensure_ascii=False, indent=2)
 
 
+def bm25_search_ids(
+    query: str,
+    field: str = "description",
+    root_dir: str = "artifacts/chroma",
+    limit: int = 10,
+) -> list[str]:
+    """Runs BM25 search and returns ranked ids without loading the ChromaDB collection.
+
+    ChromaDB 1.1+ uses internal multiprocessing queues; loading the collection
+    from inside a ``ThreadPoolExecutor`` worker triggers pickle errors on local
+    closures. This function bypasses the collection entirely — BM25 only needs
+    the JSON index file, not the vector store.
+    """
+    normalized_field = _validate_field(field=field)
+    bm25_path = Path(root_dir) / "bm25" / f"{normalized_field}.json"
+    bm25_artifacts = _load_bm25_with_cache(bm25_path=bm25_path)
+    result = bm25_search(
+        index=bm25_artifacts.index,
+        query=query,
+        limit=limit,
+        model=bm25_artifacts.model,
+    )
+    log.info(f"{normalized_field=}, {len(result.ids)=}")
+    return list(result.ids)
+
+
 def _rrf(scores: list[_ScoredId], k: int) -> dict[str, float]:
     """Computes reciprocal rank fusion map for one ranked list."""
     fused: dict[str, float] = {}
     for rank, scored in enumerate(scores, start=1):
         fused[scored.doc_id] = 1.0 / (k + rank)
     return fused
+
+
+def rrf_merge_ids(
+    dense_ids: list[str],
+    sparse_ids: list[str],
+    limit: int,
+    rrf_k: int,
+) -> list[str]:
+    """RRF merge of two pre-ranked id lists; returns top-``limit`` ids by fused score.
+
+    Use this when embeddings and BM25 results have already been computed and
+    cached separately — it avoids re-parsing JSON and skips the document/metadata
+    fields that are only needed for interactive search responses.
+    """
+    dense_scored = [_ScoredId(doc_id=d, score=0.0) for d in dense_ids]
+    sparse_scored = [_ScoredId(doc_id=s, score=0.0) for s in sparse_ids]
+    dense_rrf = _rrf(dense_scored, k=rrf_k)
+    sparse_rrf = _rrf(sparse_scored, k=rrf_k)
+    doc_ids = set(dense_rrf.keys()) | set(sparse_rrf.keys())
+    hybrid_scores = {
+        doc_id: dense_rrf.get(doc_id, 0.0) + sparse_rrf.get(doc_id, 0.0)
+        for doc_id in doc_ids
+    }
+    return sorted(doc_ids, key=lambda d: hybrid_scores[d], reverse=True)[:limit]
+
+
+def _merge_rrf_results(
+    dense_json: str,
+    sparse_json: str,
+    limit: int,
+    rrf_k: int,
+) -> str:
+    """Merges dense and sparse result lists via RRF and returns JSON."""
+    dense_rows = json.loads(dense_json)
+    sparse_rows = json.loads(sparse_json)
+    dense_ranked = [
+        _ScoredId(doc_id=row["id"], score=float(row["score"])) for row in dense_rows
+    ]
+    sparse_ranked = [
+        _ScoredId(doc_id=row["id"], score=float(row["score"])) for row in sparse_rows
+    ]
+
+    dense_rrf = _rrf(dense_ranked, k=rrf_k)
+    sparse_rrf = _rrf(sparse_ranked, k=rrf_k)
+
+    doc_ids = set(dense_rrf.keys()) | set(sparse_rrf.keys())
+    hybrid_scores = {
+        doc_id: dense_rrf.get(doc_id, 0.0) + sparse_rrf.get(doc_id, 0.0)
+        for doc_id in doc_ids
+    }
+    sorted_ids = sorted(
+        hybrid_scores.keys(),
+        key=lambda doc_id: hybrid_scores[doc_id],
+        reverse=True,
+    )
+
+    dense_rows_by_id = {row["id"]: row for row in dense_rows}
+    sparse_rows_by_id = {row["id"]: row for row in sparse_rows}
+    output_rows = []
+    for rank, doc_id in enumerate(sorted_ids[:limit], start=1):
+        dense_row = dense_rows_by_id.get(doc_id, {})
+        sparse_row = sparse_rows_by_id.get(doc_id, {})
+        output_rows.append(
+            {
+                "id": doc_id,
+                "rrf_score": hybrid_scores[doc_id],
+                "semantic_score": dense_row.get("score"),
+                "sparse_score": sparse_row.get("score"),
+                "document": dense_row.get("document") or sparse_row.get("document", ""),
+                "metadata": dense_row.get("metadata") or sparse_row.get("metadata", {}),
+                "rank": rank,
+            }
+        )
+
+    log.info(f"{len(output_rows)=}, {rrf_k=}")
+    return json.dumps(output_rows, ensure_ascii=False, indent=2)
+
+
+def semantic_search_with_embedding(
+    query_embedding: list[float],
+    field: str = "description",
+    root_dir: str = "artifacts/chroma",
+    limit: int = 10,
+) -> str:
+    """Dense ChromaDB search using a pre-computed query embedding.
+
+    Skips the embedding API call entirely; the caller is responsible for
+    computing the embedding (typically in a large batch for GPU efficiency).
+    """
+    normalized_field = _validate_field(field=field)
+    root_path = Path(root_dir)
+    artifacts = _load_artifacts(root_dir=root_path, field=normalized_field)
+
+    result = artifacts.collection.query(
+        query_embeddings=[query_embedding],
+        n_results=limit,
+        include=["metadatas", "documents", "distances"],
+    )
+
+    output_rows = []
+    ids = result.get("ids", [[]])[0]
+    documents = result.get("documents", [[]])[0]
+    metadatas = result.get("metadatas", [[]])[0]
+    distances = result.get("distances", [[]])[0]
+    for row_index, row_id in enumerate(ids):
+        output_rows.append(
+            {
+                "id": row_id,
+                "score": float(1.0 - distances[row_index]),
+                "document": documents[row_index],
+                "metadata": metadatas[row_index],
+                "rank": row_index + 1,
+            }
+        )
+
+    log.info(f"{normalized_field=}, {len(output_rows)=}")
+    return json.dumps(output_rows, ensure_ascii=False, indent=2)
+
+
+def hybrid_search_with_embedding(
+    query: str,
+    query_embedding: list[float],
+    field: str = "description",
+    root_dir: str = "artifacts/chroma",
+    limit: int = 10,
+    rrf_k: int = 60,
+) -> str:
+    """Hybrid search using a pre-computed embedding for dense + BM25 for sparse.
+
+    ``query`` is still needed for the BM25 branch; the embedding API is never
+    called, which is the hot path when embeddings are pre-batched by the caller.
+    """
+    normalized_field = _validate_field(field=field)
+    dense_json = semantic_search_with_embedding(
+        query_embedding=query_embedding,
+        field=normalized_field,
+        root_dir=root_dir,
+        limit=limit,
+    )
+    sparse_json = sparse_search(
+        query=query,
+        field=normalized_field,
+        root_dir=root_dir,
+        limit=limit,
+    )
+    log.info(f"{normalized_field=}, {rrf_k=}")
+    return _merge_rrf_results(
+        dense_json=dense_json,
+        sparse_json=sparse_json,
+        limit=limit,
+        rrf_k=rrf_k,
+    )
 
 
 def hybrid_search(
@@ -274,42 +452,13 @@ def hybrid_search(
         root_dir=root_dir,
         limit=limit,
     )
-
-    dense_rows = json.loads(dense_json)
-    sparse_rows = json.loads(sparse_json)
-    dense_ranked = [_ScoredId(doc_id=row["id"], score=float(row["score"])) for row in dense_rows]
-    sparse_ranked = [_ScoredId(doc_id=row["id"], score=float(row["score"])) for row in sparse_rows]
-
-    dense_rrf = _rrf(dense_ranked, k=rrf_k)
-    sparse_rrf = _rrf(sparse_ranked, k=rrf_k)
-
-    doc_ids = set(dense_rrf.keys()) | set(sparse_rrf.keys())
-    hybrid_scores = {
-        doc_id: dense_rrf.get(doc_id, 0.0) + sparse_rrf.get(doc_id, 0.0)
-        for doc_id in doc_ids
-    }
-    sorted_ids = sorted(hybrid_scores.keys(), key=lambda doc_id: hybrid_scores[doc_id], reverse=True)
-
-    dense_rows_by_id = {row["id"]: row for row in dense_rows}
-    sparse_rows_by_id = {row["id"]: row for row in sparse_rows}
-    output_rows = []
-    for rank, doc_id in enumerate(sorted_ids[:limit], start=1):
-        dense_row = dense_rows_by_id.get(doc_id, {})
-        sparse_row = sparse_rows_by_id.get(doc_id, {})
-        output_rows.append(
-            {
-                "id": doc_id,
-                "rrf_score": hybrid_scores[doc_id],
-                "semantic_score": dense_row.get("score"),
-                "sparse_score": sparse_row.get("score"),
-                "document": dense_row.get("document") or sparse_row.get("document", ""),
-                "metadata": dense_row.get("metadata") or sparse_row.get("metadata", {}),
-                "rank": rank,
-            }
-        )
-
-    log.info(f"{normalized_field=}, {len(output_rows)=}, {rrf_k=}")
-    return json.dumps(output_rows, ensure_ascii=False, indent=2)
+    log.info(f"{normalized_field=}, {rrf_k=}")
+    return _merge_rrf_results(
+        dense_json=dense_json,
+        sparse_json=sparse_json,
+        limit=limit,
+        rrf_k=rrf_k,
+    )
 
 
 def main() -> None:

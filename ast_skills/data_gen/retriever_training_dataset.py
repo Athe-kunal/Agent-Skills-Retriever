@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import random
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -12,9 +14,16 @@ import fire
 import pandas as pd
 from datasets import Dataset, Features, Sequence, Value
 from loguru import logger as log
+from openai import OpenAI
+from tqdm import tqdm
+from tqdm.asyncio import tqdm as async_tqdm
 
 from ast_skills.data_gen.datamodels import SummaryRetrieverDataModel, TrainingData
-from ast_skills.retriever.search import hybrid_search
+from ast_skills.retriever.search import (
+    bm25_search_ids,
+    rrf_merge_ids,
+    semantic_search_with_embedding,
+)
 
 
 class _DatasetSplit(NamedTuple):
@@ -25,10 +34,9 @@ class _DatasetSplit(NamedTuple):
 
 
 class _NegativeTextLookup(NamedTuple):
-    """Text lookup for negatives by custom_id."""
+    """Summary text lookup for hard-negative mining, keyed by custom_id."""
 
     summary_by_custom_id: dict[str, str]
-    description_by_custom_id: dict[str, str]
 
 
 class _HybridSearchConfig(NamedTuple):
@@ -43,10 +51,9 @@ class _HybridSearchConfig(NamedTuple):
 
 
 class _NegativeWindowConfig(NamedTuple):
-    """Rank window and sample size for hard negatives."""
+    """Start rank and target count for hard-negative accumulation."""
 
     window_start_rank: int
-    window_end_rank: int
     negatives_per_row: int
 
 
@@ -72,8 +79,7 @@ _TRAINING_ROW_FEATURES = Features(
         "name": Value("string"),
         "summary": Value("string"),
         "description": Value("string"),
-        "in_batch_negatives_descriptions": Sequence(Value("string")),
-        "in_batch_negatives_summary": Sequence(Value("string")),
+        "negative_documents": Sequence(Value("string")),
     }
 )
 
@@ -190,8 +196,7 @@ def _write_parquet(path: Path, rows: list[TrainingData]) -> None:
                 "name": [],
                 "summary": [],
                 "description": [],
-                "in_batch_negatives_descriptions": [],
-                "in_batch_negatives_summary": [],
+                "negative_documents": [],
             },
             features=_TRAINING_ROW_FEATURES,
         )
@@ -289,20 +294,100 @@ def _pick_row_query(row: SummaryRetrieverDataModel, rng: random.Random) -> str:
 def _build_negative_lookup(
     rows: list[SummaryRetrieverDataModel],
 ) -> _NegativeTextLookup:
-    """Builds lookup maps from custom_id to summary/description text."""
-    summary_by_custom_id: dict[str, str] = {}
-    description_by_custom_id: dict[str, str] = {}
-    for row in rows:
-        summary_by_custom_id[row.custom_id] = row.summary.strip()
-        description_by_custom_id[row.custom_id] = row.description.strip()
-    return _NegativeTextLookup(
-        summary_by_custom_id=summary_by_custom_id,
-        description_by_custom_id=description_by_custom_id,
+    """Builds summary lookup map from custom_id for hard-negative mining."""
+    summary_by_custom_id = {row.custom_id: row.summary.strip() for row in rows}
+    return _NegativeTextLookup(summary_by_custom_id=summary_by_custom_id)
+
+
+def _batch_embed_queries(
+    queries: list[str],
+    embedding_base_url: str,
+    embedding_model: str,
+    api_key: str,
+    batch_size: int,
+) -> dict[str, list[float]]:
+    """Embeds all unique queries in large batches; returns a dict keyed by query string.
+
+    Sending one large batch per request allows the GPU to process a full matrix
+    multiply rather than N sequential single-vector forward passes, which is
+    the primary reason GPUs sit idle when requests arrive one at a time.
+    """
+    unique_queries = list(dict.fromkeys(q for q in queries if q))
+    if not unique_queries:
+        return {}
+
+    client = OpenAI(base_url=embedding_base_url, api_key=api_key)
+    embedding_cache: dict[str, list[float]] = {}
+    total_batches = math.ceil(len(unique_queries) / batch_size)
+
+    for batch_index in tqdm(range(total_batches), desc="Embedding queries"):
+        batch_start = batch_index * batch_size
+        batch = unique_queries[batch_start : batch_start + batch_size]
+        response = client.embeddings.create(model=embedding_model, input=batch)
+        for position, data in enumerate(response.data):
+            embedding_cache[batch[position]] = data.embedding
+
+    log.info(f"{len(unique_queries)=}, {total_batches=}")
+    return embedding_cache
+
+
+def _bm25_ranked_ids_for_field(
+    question: str,
+    field: str,
+    config: _HybridSearchConfig,
+) -> list[str]:
+    """Runs BM25 for one (question, field) pair without touching the ChromaDB collection."""
+    return bm25_search_ids(
+        query=question,
+        field=field,
+        root_dir=config.chroma_root_dir,
+        limit=config.top_k,
     )
 
 
+def _run_bm25_pair(
+    pair: tuple[str, str],
+    config: _HybridSearchConfig,
+) -> tuple[tuple[str, str], list[str]]:
+    """Runs BM25 for one (question, field) pair.
+
+    Must be a module-level function: ``ProcessPoolExecutor`` serializes submitted
+    callables via pickle, and local closures are not picklable.
+    ``_HybridSearchConfig`` is a NamedTuple so it pickles fine.
+    """
+    question, field = pair
+    return pair, _bm25_ranked_ids_for_field(question=question, field=field, config=config)
+
+
+def _batch_bm25_queries(
+    query_field_pairs: list[tuple[str, str]],
+    config: _HybridSearchConfig,
+    max_workers: int,
+) -> dict[tuple[str, str], list[str]]:
+    """Runs all (question, field) BM25 queries in parallel; returns cache keyed by pair.
+
+    Uses ``ProcessPoolExecutor`` to bypass the GIL for CPU-bound BM25 scoring.
+    The worker is a module-level function so it can be pickled for inter-process
+    dispatch. ChromaDB is never loaded here — BM25 reads only the JSON index file.
+    """
+    unique_pairs = list(dict.fromkeys(pair for pair in query_field_pairs if pair[0]))
+    if not unique_pairs:
+        return {}
+
+    bm25_cache: dict[tuple[str, str], list[str]] = {}
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_run_bm25_pair, pair, config) for pair in unique_pairs]
+        for future in tqdm(as_completed(futures), total=len(futures), desc="BM25 queries"):
+            pair, ids = future.result()
+            bm25_cache[pair] = ids
+
+    log.info(f"{len(unique_pairs)=}")
+    return bm25_cache
+
+
 def _parse_hybrid_search_ids(payload_json: str) -> list[str]:
-    """Parses ordered document ids from ``hybrid_search`` output."""
+    """Parses ordered document ids from a search JSON payload."""
     rows = json.loads(payload_json)
     if not isinstance(rows, list):
         return []
@@ -316,79 +401,75 @@ def _parse_hybrid_search_ids(payload_json: str) -> list[str]:
     return ids
 
 
-def _slice_hard_negative_window(
-    ordered_ids: list[str],
-    positive_custom_id: str,
-    config: _NegativeWindowConfig,
-) -> list[str]:
-    """Returns candidate ids from the configured hard-negative rank window."""
-    filtered_ids = [
-        candidate_id
-        for candidate_id in ordered_ids
-        if candidate_id != positive_custom_id
-    ]
-
-    if (
-        config.window_start_rank < 1
-        or config.window_end_rank < config.window_start_rank
-    ):
-        raise ValueError("Invalid hard-negative rank window.")
-
-    start_index = config.window_start_rank - 1
-    end_index = config.window_end_rank
-    return filtered_ids[start_index:end_index]
-
-
-def _hybrid_ranked_ids(
+def _hybrid_ranked_ids_precomputed(
     question: str,
+    query_embedding: list[float],
     field: str,
     config: _HybridSearchConfig,
+    bm25_cache: dict[tuple[str, str], list[str]],
 ) -> list[str]:
-    """Runs hybrid retrieval and returns ranked ids."""
-    payload_json = hybrid_search(
-        query=question,
+    """Hybrid retrieval using cached embedding (dense) and cached BM25 ids (sparse).
+
+    Both branches are pre-computed before this call; the only work here is
+    the ChromaDB ANN lookup and the lightweight RRF merge.
+    """
+    dense_json = semantic_search_with_embedding(
+        query_embedding=query_embedding,
         field=field,
         root_dir=config.chroma_root_dir,
-        embedding_base_url=config.embedding_base_url,
-        embedding_model=config.embedding_model,
-        api_key=config.api_key,
+        limit=config.top_k,
+    )
+    dense_ids = _parse_hybrid_search_ids(dense_json)
+    sparse_ids = bm25_cache.get((question, field), [])
+    return rrf_merge_ids(
+        dense_ids=dense_ids,
+        sparse_ids=sparse_ids,
         limit=config.top_k,
         rrf_k=config.rrf_k,
     )
-    return _parse_hybrid_search_ids(payload_json)
 
 
 def _mine_field_negatives(
     question: str,
+    query_embedding: list[float],
     positive_custom_id: str,
     lookup_by_custom_id: dict[str, str],
     field: str,
     hybrid_config: _HybridSearchConfig,
     window_config: _NegativeWindowConfig,
-    rng: random.Random,
+    bm25_cache: dict[tuple[str, str], list[str]],
 ) -> list[str]:
-    """Mines negatives for one field using hybrid retrieval + rank window."""
-    ranked_ids = _hybrid_ranked_ids(
-        question=question, field=field, config=hybrid_config
+    """Mines negatives for one field by greedy accumulation starting from window_start_rank.
+
+    The positive document is excluded before windowing. Starting after rank
+    ``window_start_rank`` skips the nearest neighbours (easiest negatives).
+    We accumulate until ``negatives_per_row`` are collected or the ranked list
+    is exhausted — no fixed end-rank, no subsampling.
+    """
+    if window_config.window_start_rank < 1:
+        raise ValueError(f"window_start_rank must be >= 1, got {window_config.window_start_rank=}")
+
+    ranked_ids = _hybrid_ranked_ids_precomputed(
+        question=question,
+        query_embedding=query_embedding,
+        field=field,
+        config=hybrid_config,
+        bm25_cache=bm25_cache,
     )
-    hard_window_ids = _slice_hard_negative_window(
-        ordered_ids=ranked_ids,
-        positive_custom_id=positive_custom_id,
-        config=window_config,
-    )
+
+    non_positive_ids = [cid for cid in ranked_ids if cid != positive_custom_id]
+    candidate_ids = non_positive_ids[window_config.window_start_rank - 1:]
 
     negatives: list[str] = []
-    for candidate_id in hard_window_ids:
-        negative_text = lookup_by_custom_id.get(candidate_id, "").strip()
-        if negative_text:
-            negatives.append(negative_text)
+    for candidate_id in candidate_ids:
+        text = lookup_by_custom_id.get(candidate_id, "").strip()
+        if text:
+            negatives.append(text)
+        if len(negatives) >= window_config.negatives_per_row:
+            break
 
-    if len(negatives) <= window_config.negatives_per_row:
-        return negatives
-
-    sampled_negatives = rng.sample(negatives, window_config.negatives_per_row)
-    log.info(f"{field=}, {len(negatives)=}, {len(sampled_negatives)=}")
-    return sampled_negatives
+    log.info(f"{field=}, {len(negatives)=}")
+    return negatives
 
 
 def _build_row_questions(
@@ -409,25 +490,27 @@ def _build_row_questions(
 
 async def _mine_field_negatives_async(
     question: str,
+    query_embedding: list[float],
     positive_custom_id: str,
     lookup_by_custom_id: dict[str, str],
     field: str,
     hybrid_config: _HybridSearchConfig,
     window_config: _NegativeWindowConfig,
-    rng: random.Random,
     semaphore: asyncio.Semaphore,
+    bm25_cache: dict[tuple[str, str], list[str]],
 ) -> list[str]:
     """Asynchronously mines negatives with concurrency control."""
     async with semaphore:
         return await asyncio.to_thread(
             _mine_field_negatives,
             question,
+            query_embedding,
             positive_custom_id,
             lookup_by_custom_id,
             field,
             hybrid_config,
             window_config,
-            rng,
+            bm25_cache,
         )
 
 
@@ -436,8 +519,9 @@ async def _build_training_row_async(
     lookup: _NegativeTextLookup,
     hybrid_config: _HybridSearchConfig,
     window_config: _NegativeWindowConfig,
-    seed: int,
     semaphore: asyncio.Semaphore,
+    embedding_cache: dict[str, list[float]],
+    bm25_cache: dict[tuple[str, str], list[str]],
 ) -> TrainingData | None:
     """Builds a single ``TrainingData`` row asynchronously."""
     row = row_question.row
@@ -446,32 +530,21 @@ async def _build_training_row_async(
         log.warning(f"Skipping row with empty question for {row.custom_id=}")
         return None
 
-    rng_seed_base = seed + (row_question.row_index * 10_000)
-    summary_rng = random.Random(rng_seed_base + 1)
-    description_rng = random.Random(rng_seed_base + 2)
+    query_embedding = embedding_cache.get(question)
+    if query_embedding is None:
+        log.warning(f"No pre-computed embedding for {row.custom_id=}; skipping row")
+        return None
 
-    negative_summaries_task = _mine_field_negatives_async(
+    negative_documents = await _mine_field_negatives_async(
         question=question,
+        query_embedding=query_embedding,
         positive_custom_id=row.custom_id,
         lookup_by_custom_id=lookup.summary_by_custom_id,
         field="summary",
         hybrid_config=hybrid_config,
         window_config=window_config,
-        rng=summary_rng,
         semaphore=semaphore,
-    )
-    negative_descriptions_task = _mine_field_negatives_async(
-        question=question,
-        positive_custom_id=row.custom_id,
-        lookup_by_custom_id=lookup.description_by_custom_id,
-        field="description",
-        hybrid_config=hybrid_config,
-        window_config=window_config,
-        rng=description_rng,
-        semaphore=semaphore,
-    )
-    negative_summaries, negative_descriptions = await asyncio.gather(
-        negative_summaries_task, negative_descriptions_task
+        bm25_cache=bm25_cache,
     )
 
     return TrainingData(
@@ -479,8 +552,7 @@ async def _build_training_row_async(
         name=row.name,
         summary=row.summary,
         description=row.description,
-        in_batch_negatives_descriptions=negative_descriptions,
-        in_batch_negatives_summary=negative_summaries,
+        negative_documents=negative_documents,
     )
 
 
@@ -489,35 +561,61 @@ async def _build_training_dataset_async(
     all_rows: list[SummaryRetrieverDataModel],
     hybrid_config: _HybridSearchConfig,
     window_config: _NegativeWindowConfig,
-    seed: int,
     question_pick_seed: int,
     max_concurrency: int,
+    embedding_batch_size: int,
+    split_name: str = "split",
 ) -> list[TrainingData]:
-    """Builds ``TrainingData`` rows for one split using async concurrency."""
+    """Builds ``TrainingData`` rows for one split using async concurrency.
+
+    Pipeline phases (each with a progress bar):
+      1. Batch embed all questions (GPU-saturating).
+      2. Batch BM25 all (question, "summary") pairs in parallel (CPU-parallel).
+      3. ChromaDB ANN lookup + RRF merge per row (async concurrent).
+    """
     if max_concurrency < 1:
         raise ValueError("max_concurrency must be >= 1.")
 
     lookup = _build_negative_lookup(all_rows)
-    row_questions = _build_row_questions(
-        rows=rows, question_pick_seed=question_pick_seed
-    )
-    semaphore = asyncio.Semaphore(max_concurrency)
+    row_questions = _build_row_questions(rows=rows, question_pick_seed=question_pick_seed)
 
-    tasks: list[asyncio.Task[TrainingData | None]] = []
-    for row_question in row_questions:
-        task = asyncio.create_task(
+    all_questions = [rq.question for rq in row_questions]
+    embedding_cache = await asyncio.to_thread(
+        _batch_embed_queries,
+        all_questions,
+        hybrid_config.embedding_base_url,
+        hybrid_config.embedding_model,
+        hybrid_config.api_key,
+        embedding_batch_size,
+    )
+
+    query_field_pairs = [(rq.question, "summary") for rq in row_questions]
+    bm25_cache = await asyncio.to_thread(
+        _batch_bm25_queries,
+        query_field_pairs,
+        hybrid_config,
+        max_concurrency,
+    )
+
+    semaphore = asyncio.Semaphore(max_concurrency)
+    tasks: list[asyncio.Task[TrainingData | None]] = [
+        asyncio.create_task(
             _build_training_row_async(
                 row_question=row_question,
                 lookup=lookup,
                 hybrid_config=hybrid_config,
                 window_config=window_config,
-                seed=seed,
                 semaphore=semaphore,
+                embedding_cache=embedding_cache,
+                bm25_cache=bm25_cache,
             )
         )
-        tasks.append(task)
+        for row_question in row_questions
+    ]
 
-    training_rows_or_none = await asyncio.gather(*tasks)
+    training_rows_or_none = await async_tqdm.gather(
+        *tasks, desc=f"Mining negatives [{split_name}]"
+    )
     output_rows = [row for row in training_rows_or_none if row is not None]
     log.info(f"{max_concurrency=}, {len(output_rows)=}")
     return output_rows
@@ -528,9 +626,10 @@ def _build_training_dataset(
     all_rows: list[SummaryRetrieverDataModel],
     hybrid_config: _HybridSearchConfig,
     window_config: _NegativeWindowConfig,
-    seed: int,
     question_pick_seed: int,
     max_concurrency: int,
+    embedding_batch_size: int,
+    split_name: str = "split",
 ) -> list[TrainingData]:
     """Sync wrapper around async split dataset builder."""
     return asyncio.run(
@@ -539,9 +638,10 @@ def _build_training_dataset(
             all_rows=all_rows,
             hybrid_config=hybrid_config,
             window_config=window_config,
-            seed=seed,
             question_pick_seed=question_pick_seed,
             max_concurrency=max_concurrency,
+            embedding_batch_size=embedding_batch_size,
+            split_name=split_name,
         )
     )
 
@@ -560,9 +660,9 @@ def build_training_and_validation_datasets(
     top_k: int = 100,
     rrf_k: int = 60,
     window_start_rank: int = 5,
-    window_end_rank: int = 36,
     negatives_per_row: int = 32,
     max_concurrency: int = 256,
+    embedding_batch_size: int = 512,
     smoke_test: bool = False,
 ) -> None:
     """Builds train/validation datasets with hybrid-mined hard negatives.
@@ -573,18 +673,21 @@ def build_training_and_validation_datasets(
       output_train_parquet_path: Output path for train dataset (Parquet).
       output_validation_parquet_path: Output path for validation dataset (Parquet).
       validation_ratio: Fraction of rows allocated to validation split.
-      random_seed: Seed for train/validation split and negative subsampling.
+      random_seed: Seed for train/validation split shuffling.
       question_pick_seed: Seed for randomly choosing one ``seed_question`` per row.
       chroma_root_dir: Root directory containing Chroma and BM25 artifacts.
       embedding_base_url: OpenAI-compatible embedding endpoint.
       embedding_model: Embedding model used for dense query encoding.
       api_key: API key for embedding endpoint.
-      top_k: Hybrid retrieval top-K before hard-negative windowing.
+      top_k: Hybrid retrieval top-K.
       rrf_k: Reciprocal-rank-fusion constant.
-      window_start_rank: First rank (1-indexed) of hard-negative window.
-      window_end_rank: Last rank (1-indexed, inclusive) of hard-negative window.
-      negatives_per_row: Number of sampled negatives per field.
+      window_start_rank: First rank (1-indexed) to start accumulating summary negatives.
+        Ranks below this are skipped (too easy / too similar to the positive).
+      negatives_per_row: Target number of summary negatives per row; accumulation
+        stops as soon as this count is reached.
       max_concurrency: Maximum number of concurrent row/field retrieval tasks.
+      embedding_batch_size: Number of queries per embedding API call. Larger
+        batches saturate the GPU more efficiently (default 512).
       smoke_test: If True, only the first input row is processed for outputs; the
         full file is still used to resolve retrieved ids to summary/description text.
     """
@@ -611,7 +714,6 @@ def build_training_and_validation_datasets(
     )
     window_config = _NegativeWindowConfig(
         window_start_rank=window_start_rank,
-        window_end_rank=window_end_rank,
         negatives_per_row=negatives_per_row,
     )
 
@@ -620,18 +722,20 @@ def build_training_and_validation_datasets(
         all_rows=corpus_rows,
         hybrid_config=hybrid_config,
         window_config=window_config,
-        seed=random_seed,
         question_pick_seed=question_pick_seed,
         max_concurrency=max_concurrency,
+        embedding_batch_size=embedding_batch_size,
+        split_name="train",
     )
     validation_rows = _build_training_dataset(
         rows=split.validation_rows,
         all_rows=corpus_rows,
         hybrid_config=hybrid_config,
         window_config=window_config,
-        seed=random_seed + 1,
         question_pick_seed=question_pick_seed,
         max_concurrency=max_concurrency,
+        embedding_batch_size=embedding_batch_size,
+        split_name="validation",
     )
 
     _write_parquet(train_path, train_rows)
@@ -642,7 +746,6 @@ def main() -> None:
     """CLI entrypoint."""
     fire.Fire(
         {
-            "build": build_training_and_validation_datasets,
             "build_retriever_training_dataset": build_training_and_validation_datasets,
         }
     )

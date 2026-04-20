@@ -38,14 +38,18 @@ class SummaryRetrieverDataModel:
 
 @dataclass(frozen=True)
 class TrainingData:
-    """One training/evaluation row used by retriever fine-tuning."""
+    """One training/evaluation row used by retriever fine-tuning.
+
+    Designed for anchor-point loss: ``question`` is the anchor,
+    ``summary`` and ``description`` are the positive documents, and
+    ``negative_documents`` holds hard negatives mined from both fields combined.
+    """
 
     question: str
     name: str
     summary: str
     description: str
-    in_batch_negatives_descriptions: list[str]
-    in_batch_negatives_summary: list[str]
+    negative_documents: list[str]
 
 
 class SkillMdSummaryExtraction(pydantic.BaseModel):

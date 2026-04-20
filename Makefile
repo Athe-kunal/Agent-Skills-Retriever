@@ -14,7 +14,6 @@ MINED_TRAIN_PARQUET ?= artifacts/retriever_training/train.parquet
 MINED_VALIDATION_PARQUET ?= artifacts/retriever_training/validation.parquet
 MINED_TOP_K ?= 37
 MINED_WINDOW_START ?= 6
-MINED_WINDOW_END ?= 37
 MINED_NEGATIVES_PER_ROW ?= 32
 MINED_RANDOM_SEED ?= 13
 MINED_VALIDATION_RATIO ?= 0.1
@@ -76,7 +75,6 @@ build-mined-negatives-parquet:
 		--max_concurrency $(MINED_MAX_CONCURRENCY) \
 		--top_k $(MINED_TOP_K) \
 		--window_start_rank $(MINED_WINDOW_START) \
-		--window_end_rank $(MINED_WINDOW_END) \
 		--negatives_per_row $(MINED_NEGATIVES_PER_ROW)
 
 .PHONY: retriever-train
