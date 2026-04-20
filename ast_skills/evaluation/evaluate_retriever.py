@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 import torch
 import wandb
+from torch.utils.data import DataLoader, Dataset
 import yaml
 from loguru import logger as log
 from openai import AsyncOpenAI
@@ -1475,6 +1476,85 @@ def _wait_for_vllm_server_ready(
     )
 
 
+_COLBERT_HF_MODELS: frozenset[str] = frozenset({
+    "jinaai/jina-colbert-v2",
+    "lightonai/GTE-ModernColBERT-v1",
+})
+
+
+def _is_colbert_hf_model(model_name: str) -> bool:
+    """Returns True for ColBERT models that run via HuggingFace instead of vLLM."""
+    return model_name in _COLBERT_HF_MODELS
+
+
+class _ColBERTTextDataset(Dataset):
+    """Thin Dataset wrapper that exposes a list of strings for DataLoader workers."""
+
+    def __init__(self, texts: list[str]) -> None:
+        self._texts = texts
+
+    def __len__(self) -> int:
+        return len(self._texts)
+
+    def __getitem__(self, index: int) -> str:
+        return self._texts[index]
+
+
+def _make_tokenize_collate_fn(
+    tokenizer: object,
+) -> object:
+    """Returns a collate_fn that tokenizes a batch of strings in DataLoader workers."""
+
+    def collate_fn(texts: list[str]) -> dict[str, torch.Tensor]:
+        return tokenizer(  # type: ignore[operator]
+            texts,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+            max_length=512,
+        )
+
+    return collate_fn
+
+
+def _encode_colbert_hf_embeddings(
+    assets: _HfEncoderAssets,
+    texts: Sequence[str],
+    batch_size: int,
+    num_workers: int,
+) -> np.ndarray:
+    """Encodes normalized sentence embeddings for ColBERT models via HuggingFace.
+
+    Uses DataLoader with worker processes for prefetching and tokenization
+    parallelism, and pin_memory for fast CPU-to-GPU transfers.
+    """
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    dataset = _ColBERTTextDataset(texts=list(texts))
+    collate_fn = _make_tokenize_collate_fn(tokenizer=assets.tokenizer)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        pin_memory=assets.device == "cuda",
+        persistent_workers=num_workers > 0,
+    )
+    all_embeddings: list[np.ndarray] = []
+    for tokenized in tqdm(loader, desc="ColBERT HF embeddings"):
+        tokenized = {k: v.to(assets.device) for k, v in tokenized.items()}
+        with torch.no_grad():
+            outputs = assets.model(**tokenized)
+        pooled = _mean_pool_embeddings(
+            last_hidden_state=outputs.last_hidden_state,
+            attention_mask=tokenized["attention_mask"],
+        )
+        normalized = torch.nn.functional.normalize(pooled, p=2, dim=1)
+        all_embeddings.append(normalized.detach().cpu().numpy().astype(np.float32))
+    embeddings = np.vstack(all_embeddings)
+    log.info(f"{len(texts)=}, {batch_size=}, {num_workers=}, {embeddings.shape=}")
+    return embeddings
+
+
 def _maybe_start_vllm_server(
     model_name: str,
     vllm_port: int,
@@ -1488,6 +1568,13 @@ def _maybe_start_vllm_server(
     probe_timeout_sec: float = _VLLM_STARTUP_PROBE_TIMEOUT_SEC,
 ) -> _VllmStartupResult:
     """Starts vLLM server in the background when requested."""
+    if _is_colbert_hf_model(model_name):
+        log.info(f"{model_name=}, skipping vLLM startup, using ColBERT HF encoder")
+        return _VllmStartupResult(
+            process=None,
+            resolved_port=vllm_port,
+            resolved_base_url=vllm_base_url,
+        )
     if not start_vllm_server:
         return _VllmStartupResult(
             process=None,
@@ -1514,6 +1601,7 @@ def _maybe_start_vllm_server(
         str(resolved_port),
         "--host",
         "0.0.0.0",
+        "--trust-remote-code",
     ]
     environment = dict(os.environ)
     environment["CUDA_VISIBLE_DEVICES"] = str(vllm_gpu_device)
@@ -1611,8 +1699,14 @@ def _encode_texts_for_indexing(
     vllm_api_key: str,
     vllm_max_concurrency: int,
     progress_desc: str,
+    hf_num_workers: int = 4,
 ) -> np.ndarray:
     """Encodes corpus texts for Chroma indexing via HF transformers or vLLM."""
+    if _is_colbert_hf_model(model_name):
+        assets = _load_hf_encoder(model_name=model_name)
+        return _encode_colbert_hf_embeddings(
+            assets=assets, texts=texts, batch_size=batch_size, num_workers=hf_num_workers
+        )
     if use_hf_encoder:
         assets = _load_hf_encoder(model_name=model_name)
         return _encode_hf_sentence_embeddings(
@@ -1642,6 +1736,7 @@ def _load_chroma_corpus_artifacts(
     vllm_api_key: str,
     vllm_max_concurrency: int,
     use_hf_encoder: bool = False,
+    hf_num_workers: int = 4,
 ) -> _ChromaCorpusArtifacts:
     """Loads cached corpus embeddings from Chroma or indexes them once."""
     sanitized_model_name = _sanitize_model_name(model_name=model_name)
@@ -1678,6 +1773,7 @@ def _load_chroma_corpus_artifacts(
         vllm_api_key=vllm_api_key,
         vllm_max_concurrency=vllm_max_concurrency,
         progress_desc=f"Chroma corpus embeddings ({field_key})",
+        hf_num_workers=hf_num_workers,
     )
     ids = [f"{field_key}_{index}" for index in range(len(corpus.texts))]
     metadatas = [{"name": name} for name in corpus.names]
@@ -1756,6 +1852,7 @@ def evaluate_validation_parquet(
     use_hf_encoder: bool = False,
     include_hybrid: bool = True,
     hybrid_rrf_k: int = 60,
+    hf_num_workers: int = 4,
 ) -> dict[str, dict[str, dict[str, float]]]:
     """Evaluates summary/description retrieval on validation parquet.
 
@@ -1799,7 +1896,15 @@ def evaluate_validation_parquet(
         ),
     )
 
-    if use_hf_encoder:
+    if _is_colbert_hf_model(retrieval_model):
+        hf_assets = _load_hf_encoder(model_name=retrieval_model)
+        query_embeddings = _encode_colbert_hf_embeddings(
+            assets=hf_assets,
+            texts=validation_payload.query_texts,
+            batch_size=sentence_batch_size,
+            num_workers=hf_num_workers,
+        )
+    elif use_hf_encoder:
         hf_assets = _load_hf_encoder(model_name=retrieval_model)
         query_embeddings = _encode_hf_sentence_embeddings(
             assets=hf_assets,
@@ -1828,17 +1933,23 @@ def evaluate_validation_parquet(
             )
             metrics_by_model: dict[str, RetrievalMetrics] = {}
 
+            corpus_batch_size = (
+                sentence_batch_size
+                if _is_colbert_hf_model(retrieval_model) or use_hf_encoder
+                else vllm_batch_size
+            )
             chroma_artifacts = _load_chroma_corpus_artifacts(
                 artifacts_root=artifacts_root,
                 field_key=field_key,
                 model_name=retrieval_model,
                 corpus=corpus,
                 force_reindex=force_reindex,
-                batch_size=vllm_batch_size,
+                batch_size=corpus_batch_size,
                 vllm_base_url=vllm_base_url,
                 vllm_api_key=vllm_api_key,
                 vllm_max_concurrency=vllm_max_concurrency,
                 use_hf_encoder=use_hf_encoder,
+                hf_num_workers=hf_num_workers,
             )
             dense_score_matrix = _score_bi_encoder(
                 query_embeddings=query_embeddings,
@@ -2030,6 +2141,8 @@ def build_validation_indexes(
     vllm_port: int = 8002,
     vllm_gpu_memory_utilization: float = 0.9,
     use_hf_encoder: bool = False,
+    sentence_batch_size: int = 64,
+    hf_num_workers: int = 4,
 ) -> dict[str, dict[str, int]]:
     """Builds and caches Chroma and BM25 artifacts for validation retrieval."""
     uses_default_base_url = not vllm_base_url
@@ -2084,17 +2197,23 @@ def build_validation_indexes(
                 rows=validation_payload.rows,
                 field_key=field_key,
             )
+            corpus_batch_size = (
+                sentence_batch_size
+                if _is_colbert_hf_model(retrieval_model) or use_hf_encoder
+                else vllm_batch_size
+            )
             chroma_artifacts = _load_chroma_corpus_artifacts(
                 artifacts_root=artifacts_root,
                 field_key=field_key,
                 model_name=retrieval_model,
                 corpus=corpus,
                 force_reindex=force_reindex,
-                batch_size=vllm_batch_size,
+                batch_size=corpus_batch_size,
                 vllm_base_url=vllm_base_url,
                 vllm_api_key=vllm_api_key,
                 vllm_max_concurrency=vllm_max_concurrency,
                 use_hf_encoder=use_hf_encoder,
+                hf_num_workers=hf_num_workers,
             )
             bm25_cache = _load_or_write_bm25_docs(
                 artifacts_root=artifacts_root,

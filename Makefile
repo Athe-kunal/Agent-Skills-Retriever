@@ -36,6 +36,12 @@ MINED_KEEP_NEGATIVES ?= 32
 MINED_RRF_K ?= 60
 MINED_INCLUDE_NEGATIVE_DESCRIPTIONS ?= false
 
+EVAL_DENSE_MODELS ?= lightonai/GTE-ModernColBERT-v1,jinaai/jina-colbert-v2
+EVAL_VAL_PARQUET ?= artifacts/val.parquet
+EVAL_WANDB_PROJECT ?= ast-skills-retriever
+
+# Qwen/Qwen3-Embedding-0.6B,Qwen/Qwen3-Embedding-4B,Qwen/Qwen3-Embedding-8B,sentence-transformers/bert-large-nli-mean-tokens
+
 .PHONY: vllm-embd-serve
 vllm-embd-serve:
 	CUDA_VISIBLE_DEVICES=$(GPU_DEVICE) uv run vllm serve $(EMBD_MODEL) \
@@ -134,8 +140,9 @@ retriever-evaluate-two-gpu:
 	bash scripts/run_validation_two_gpu.sh \
 		"$(EVAL_DENSE_MODELS)" \
 		"$(EVAL_VAL_PARQUET)" \
-		"$(EVAL_WANDB_PROJECT)" \
-		"$(EVAL_WANDB_ENTITY)"
+		"$(EVAL_WANDB_PROJECT)" 
+
+# "$(EVAL_WANDB_ENTITY)"
 
 .PHONY: build-mined-training-data
 build-mined-training-data:
