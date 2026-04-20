@@ -46,3 +46,16 @@ class ValidatedTrainingData:
     num_from_seed_questions: str
     num_from_scenario_questions: str
 
+@dataclass(frozen=True)
+class MinedTrainingDataRow:
+    """One output row containing an anchor and mined hard negatives."""
+
+    anchor_id: str
+    name: str
+    markdown_content: str
+    summary: str
+    description: str
+    question: str
+    negative_summaries: list[str]
+    negative_descriptions: list[str] | None = None
+
