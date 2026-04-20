@@ -7,12 +7,14 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import fire
+import numpy as np
 import pandas as pd
 import torch
 import wandb
 import yaml
 from loguru import logger as log
 from sentence_transformers import InputExample, SentenceTransformer, losses
+from sentence_transformers.evaluation import SentenceEvaluator
 from torch.utils.data import DataLoader
 
 from ast_skills.train.datamodels import TrainingParquetRow
@@ -27,20 +29,32 @@ class _ParsedTrainingData(NamedTuple):
     dropped_rows: int
 
 
+class _RetrievalDataset(NamedTuple):
+    """Query/document pairs prepared for retrieval metric reporting."""
+
+    queries: list[str]
+    relevant_document_indices: list[int]
+    documents: list[str]
+
+
 @dataclass(frozen=True)
 class TrainConfig:
     """Public configuration for parquet-based training."""
 
     train_parquet: str
+    validation_parquet: str
     output_dir: str = "artifacts/sentence_transformers/qwen3-summary"
     base_model_name: str = _DEFAULT_BASE_MODEL
     epochs: int = 3
     batch_size: int = 32
     learning_rate: float = 2e-5
     warmup_steps: int = 200
+    evaluation_steps: int = 200
+    checkpoint_save_steps: int = 200
     seed: int = 13
     use_hard_negatives: bool = False
     triplet_margin: float = 0.2
+    use_wandb: bool = True
     wandb_project: str = "ast-skills-retriever"
     wandb_entity: str = ""
     run_name: str = "qwen3-parquet-train"
@@ -58,12 +72,82 @@ def _read_yaml(path: Path) -> dict[str, Any]:
 
 def _train_kwargs_from_config(config: dict[str, Any]) -> dict[str, Any]:
     """Extracts kwargs for ``train`` from config payload."""
+    if _is_nested_config(config):
+        nested_config = _train_config_from_nested_config(config)
+        kwargs = asdict(nested_config)
+        log.info(f"{kwargs=}")
+        return kwargs
     train_config = config.get("train", {})
     if not isinstance(train_config, dict):
         raise ValueError("`train` section must be a mapping.")
     kwargs = dict(train_config)
+    _validate_required_paths(kwargs)
     log.info(f"{kwargs=}")
     return kwargs
+
+
+def _is_nested_config(config: dict[str, Any]) -> bool:
+    """Returns true when config payload uses nested sections."""
+    nested_keys = {"input", "model", "training", "output", "logging"}
+    is_nested = bool(nested_keys.intersection(config.keys()))
+    log.info(f"{is_nested=}")
+    return is_nested
+
+
+def _required_non_empty_string(raw_value: Any, field_name: str) -> str:
+    """Normalizes and validates required non-empty string fields."""
+    value = str(raw_value).strip()
+    if not value:
+        raise ValueError(f"`{field_name}` must be a non-empty string.")
+    log.info(f"{field_name=}, {value=}")
+    return value
+
+
+def _validate_required_paths(kwargs: dict[str, Any]) -> None:
+    """Validates required parquet paths for training and validation."""
+    train_parquet = _required_non_empty_string(kwargs.get("train_parquet", ""), "train_parquet")
+    validation_parquet = _required_non_empty_string(
+        kwargs.get("validation_parquet", ""),
+        "validation_parquet",
+    )
+    kwargs["train_parquet"] = train_parquet
+    kwargs["validation_parquet"] = validation_parquet
+
+
+def _train_config_from_nested_config(config: dict[str, Any]) -> TrainConfig:
+    """Extracts ``TrainConfig`` from nested config sections."""
+    input_config = dict(config.get("input", {}))
+    model_config = dict(config.get("model", {}))
+    training_config = dict(config.get("training", {}))
+    output_config = dict(config.get("output", {}))
+    logging_config = dict(config.get("logging", {}))
+    train_config = TrainConfig(
+        train_parquet=_required_non_empty_string(
+            input_config.get("mined_parquet_path", ""),
+            "input.mined_parquet_path",
+        ),
+        validation_parquet=_required_non_empty_string(
+            input_config.get("validation_parquet_path", ""),
+            "input.validation_parquet_path",
+        ),
+        output_dir=str(output_config.get("dir", "artifacts/sentence_transformers/qwen3-summary")),
+        base_model_name=str(model_config.get("name", _DEFAULT_BASE_MODEL)),
+        epochs=int(training_config.get("epochs", 3)),
+        batch_size=int(training_config.get("batch_size", 32)),
+        learning_rate=float(training_config.get("learning_rate", 2e-5)),
+        warmup_steps=int(training_config.get("warmup_steps", 200)),
+        evaluation_steps=int(training_config.get("evaluation_steps", 200)),
+        checkpoint_save_steps=int(training_config.get("checkpoint_save_steps", 200)),
+        seed=int(training_config.get("seed", 13)),
+        use_hard_negatives=bool(training_config.get("use_hard_negatives", False)),
+        triplet_margin=float(training_config.get("triplet_margin", 0.2)),
+        use_wandb=bool(logging_config.get("use_wandb", True)),
+        wandb_project=str(logging_config.get("project", "ast-skills-retriever")),
+        wandb_entity=str(logging_config.get("entity", "")),
+        run_name=str(logging_config.get("run_name", "qwen3-parquet-train")),
+    )
+    log.info(f"{train_config=}")
+    return train_config
 
 
 def _read_parquet_rows(train_parquet: str) -> _ParsedTrainingData:
@@ -196,21 +280,133 @@ def _build_wandb_config(config: TrainConfig, row_count: int, dropped_rows: int) 
     return payload
 
 
+def _build_retrieval_dataset(rows: list[TrainingParquetRow], split_name: str) -> _RetrievalDataset:
+    """Builds retrieval dataset used for train/validation metric computation."""
+    queries: list[str] = []
+    relevant_document_indices: list[int] = []
+    documents: list[str] = []
+    document_index_by_text: dict[str, int] = {}
+
+    for row in rows:
+        positive_summary = row.positive_summary.strip()
+        if not positive_summary:
+            continue
+        if positive_summary not in document_index_by_text:
+            document_index_by_text[positive_summary] = len(documents)
+            documents.append(positive_summary)
+        queries.append(row.question)
+        relevant_document_indices.append(document_index_by_text[positive_summary])
+
+    dataset = _RetrievalDataset(
+        queries=queries,
+        relevant_document_indices=relevant_document_indices,
+        documents=documents,
+    )
+    log.info(f"{split_name=}, {len(dataset.queries)=}, {len(dataset.documents)=}")
+    return dataset
+
+
+def _compute_top_k_hits(ranked_indices: np.ndarray, positive_index: int, k: int) -> float:
+    """Computes whether positive index appears in top-k."""
+    top_k_indices = ranked_indices[:k]
+    hit = float(positive_index in top_k_indices)
+    return hit
+
+
+def _compute_mrr(ranked_indices: np.ndarray, positive_index: int) -> float:
+    """Computes reciprocal rank for one query."""
+    positions = np.where(ranked_indices == positive_index)[0]
+    if len(positions) == 0:
+        return 0.0
+    reciprocal_rank = 1.0 / float(positions[0] + 1)
+    return reciprocal_rank
+
+
+def _compute_validation_metrics(
+    model: SentenceTransformer,
+    dataset: _RetrievalDataset,
+) -> dict[str, float]:
+    """Computes retrieval metrics on validation parquet rows."""
+    if not dataset.queries or not dataset.documents:
+        return {
+            "eval/hit@1": 0.0,
+            "eval/hit@3": 0.0,
+            "eval/hit@5": 0.0,
+            "eval/hit@10": 0.0,
+            "eval/mrr": 0.0,
+        }
+
+    query_embeddings = model.encode(dataset.queries, normalize_embeddings=True, convert_to_numpy=True)
+    document_embeddings = model.encode(dataset.documents, normalize_embeddings=True, convert_to_numpy=True)
+    similarity_matrix = np.matmul(query_embeddings, document_embeddings.T)
+
+    hit_at_1 = 0.0
+    hit_at_3 = 0.0
+    hit_at_5 = 0.0
+    hit_at_10 = 0.0
+    mrr = 0.0
+    for row_index, positive_index in enumerate(dataset.relevant_document_indices):
+        ranked_indices = np.argsort(-similarity_matrix[row_index])
+        hit_at_1 += _compute_top_k_hits(ranked_indices, positive_index, k=1)
+        hit_at_3 += _compute_top_k_hits(ranked_indices, positive_index, k=3)
+        hit_at_5 += _compute_top_k_hits(ranked_indices, positive_index, k=5)
+        hit_at_10 += _compute_top_k_hits(ranked_indices, positive_index, k=10)
+        mrr += _compute_mrr(ranked_indices, positive_index)
+
+    num_queries = float(len(dataset.queries))
+    metrics = {
+        "eval/hit@1": hit_at_1 / num_queries,
+        "eval/hit@3": hit_at_3 / num_queries,
+        "eval/hit@5": hit_at_5 / num_queries,
+        "eval/hit@10": hit_at_10 / num_queries,
+        "eval/mrr": mrr / num_queries,
+    }
+    log.info(f"{metrics=}")
+    return metrics
+
+
+class _ParquetValidationEvaluator(SentenceEvaluator):
+    """Sentence-transformer evaluator for parquet-based retrieval metrics."""
+
+    def __init__(self, validation_dataset: _RetrievalDataset, use_wandb: bool):
+        self._validation_dataset = validation_dataset
+        self._use_wandb = use_wandb
+
+    def __call__(
+        self,
+        model: SentenceTransformer,
+        output_path: str | None = None,
+        epoch: int = -1,
+        steps: int = -1,
+    ) -> float:
+        del output_path
+        metrics = _compute_validation_metrics(model=model, dataset=self._validation_dataset)
+        metrics["eval/epoch"] = float(epoch)
+        metrics["eval/steps"] = float(steps)
+        if self._use_wandb and wandb.run is not None:
+            wandb.log(metrics)
+        return metrics["eval/mrr"]
+
+
 def _train_model(
     model: SentenceTransformer,
     dataloader: DataLoader,
     train_loss: Any,
     config: TrainConfig,
+    evaluator: SentenceEvaluator | None,
 ) -> None:
     """Runs sentence-transformer fit loop."""
     model.fit(
         train_objectives=[(dataloader, train_loss)],
         epochs=config.epochs,
+        evaluator=evaluator,
+        evaluation_steps=config.evaluation_steps if evaluator is not None else 0,
         warmup_steps=config.warmup_steps,
         optimizer_params={"lr": config.learning_rate},
         show_progress_bar=True,
         output_path=config.output_dir,
         checkpoint_path=config.output_dir,
+        checkpoint_save_steps=config.checkpoint_save_steps,
         checkpoint_save_total_limit=2,
     )
     model.save(config.output_dir)
@@ -219,15 +415,19 @@ def _train_model(
 
 def train(
     train_parquet: str,
+    validation_parquet: str,
     output_dir: str = "artifacts/sentence_transformers/qwen3-summary",
     base_model_name: str = _DEFAULT_BASE_MODEL,
     epochs: int = 3,
     batch_size: int = 32,
     learning_rate: float = 2e-5,
     warmup_steps: int = 200,
+    evaluation_steps: int = 200,
+    checkpoint_save_steps: int = 200,
     seed: int = 13,
     use_hard_negatives: bool = False,
     triplet_margin: float = 0.2,
+    use_wandb: bool = True,
     wandb_project: str = "ast-skills-retriever",
     wandb_entity: str = "",
     run_name: str = "qwen3-parquet-train",
@@ -235,15 +435,19 @@ def train(
     """Trains sentence-transformer from parquet anchors and summaries."""
     config = TrainConfig(
         train_parquet=train_parquet,
+        validation_parquet=validation_parquet,
         output_dir=output_dir,
         base_model_name=base_model_name,
         epochs=epochs,
         batch_size=batch_size,
         learning_rate=learning_rate,
         warmup_steps=warmup_steps,
+        evaluation_steps=evaluation_steps,
+        checkpoint_save_steps=checkpoint_save_steps,
         seed=seed,
         use_hard_negatives=use_hard_negatives,
         triplet_margin=triplet_margin,
+        use_wandb=use_wandb,
         wandb_project=wandb_project,
         wandb_entity=wandb_entity,
         run_name=run_name,
@@ -257,21 +461,38 @@ def train(
 
     model = SentenceTransformer(config.base_model_name)
     train_loss = _build_loss(model, config.use_hard_negatives, config.triplet_margin)
-
-    wandb.init(
-        project=config.wandb_project,
-        entity=config.wandb_entity or None,
-        name=config.run_name,
-        config=_build_wandb_config(config, row_count=len(parsed.rows), dropped_rows=parsed.dropped_rows),
+    evaluator: SentenceEvaluator | None = None
+    validation_rows = _read_parquet_rows(config.validation_parquet).rows
+    validation_dataset = _build_retrieval_dataset(validation_rows, split_name="validation")
+    evaluator = _ParquetValidationEvaluator(
+        validation_dataset=validation_dataset,
+        use_wandb=config.use_wandb,
     )
+
+    if config.use_wandb:
+        wandb.init(
+            project=config.wandb_project,
+            entity=config.wandb_entity or None,
+            name=config.run_name,
+            config=_build_wandb_config(config, row_count=len(parsed.rows), dropped_rows=parsed.dropped_rows),
+        )
     try:
-        _train_model(model=model, dataloader=dataloader, train_loss=train_loss, config=config)
+        _train_model(
+            model=model,
+            dataloader=dataloader,
+            train_loss=train_loss,
+            config=config,
+            evaluator=evaluator,
+        )
+        if evaluator is not None:
+            evaluator(model=model, epoch=config.epochs, steps=-1)
     finally:
-        wandb.finish()
+        if config.use_wandb:
+            wandb.finish()
 
 
-def train_from_config(config_path: str = "configs/train.yaml") -> None:
-    """Loads YAML config and runs ``train`` with its ``train`` section."""
+def train_from_config(config_path: str = "configs/train.config.yaml") -> None:
+    """Loads YAML config and runs ``train`` from nested or legacy sections."""
     payload = _read_yaml(Path(config_path))
     train_kwargs = _train_kwargs_from_config(payload)
     train(**train_kwargs)
