@@ -85,6 +85,13 @@ class _ValidationPayload(NamedTuple):
     expected_names: list[str]
 
 
+class _ValidationDedupResult(NamedTuple):
+    """Deduplicated validation rows with duplicate counters."""
+
+    rows: list[DataPoint]
+    duplicate_name_question_rows: int
+
+
 class _QuestionSplitRows(NamedTuple):
     """Expanded rows after question-level train/validation split."""
 
@@ -147,6 +154,14 @@ class _BM25CachePayload(NamedTuple):
 
     texts: list[str]
     names: list[str]
+
+
+class _VllmStartupResult(NamedTuple):
+    """Resolved vLLM startup settings and optional spawned process."""
+
+    process: subprocess.Popen[bytes] | None
+    resolved_port: int
+    resolved_base_url: str
 
 
 class _HybridRrfConfig(NamedTuple):
@@ -262,6 +277,33 @@ def _data_point_from_parquet_record(record: dict[str, Any]) -> DataPoint:
     return DataPoint(**kwargs)
 
 
+def _deduplicate_validation_rows(rows: Sequence[DataPoint]) -> _ValidationDedupResult:
+    """Drops exact duplicate validation queries by (skill name, question)."""
+    deduped_rows: list[DataPoint] = []
+    seen_name_question_pairs: set[tuple[str, str]] = set()
+    duplicate_name_question_rows = 0
+
+    for row in rows:
+        normalized_name = row.name.strip().casefold()
+        normalized_question = row.question.strip().casefold()
+        dedup_key = (normalized_name, normalized_question)
+        if dedup_key in seen_name_question_pairs:
+            duplicate_name_question_rows += 1
+            continue
+        seen_name_question_pairs.add(dedup_key)
+        deduped_rows.append(row)
+
+    result = _ValidationDedupResult(
+        rows=deduped_rows,
+        duplicate_name_question_rows=duplicate_name_question_rows,
+    )
+    log.info(
+        f"{len(rows)=}, {len(result.rows)=}, "
+        f"{result.duplicate_name_question_rows=}"
+    )
+    return result
+
+
 def _load_validation_payload(validation_parquet: str) -> _ValidationPayload:
     """Loads ``DataPoint`` rows from validation parquet."""
     validation_path = Path(validation_parquet)
@@ -269,6 +311,8 @@ def _load_validation_payload(validation_parquet: str) -> _ValidationPayload:
     rows: list[DataPoint] = []
     for record in dataframe.to_dict(orient="records"):
         rows.append(_data_point_from_parquet_record(record))
+    deduped_validation = _deduplicate_validation_rows(rows=rows)
+    rows = deduped_validation.rows
 
     query_texts = [row.question.strip() for row in rows if row.question.strip()]
     expected_names = [row.name.strip() for row in rows if row.question.strip()]
@@ -277,7 +321,10 @@ def _load_validation_payload(validation_parquet: str) -> _ValidationPayload:
         query_texts=query_texts,
         expected_names=expected_names,
     )
-    log.info(f"{validation_path=}, {len(rows)=}, {len(query_texts)=}")
+    log.info(
+        f"{validation_path=}, {len(rows)=}, {len(query_texts)=}, "
+        f"{deduped_validation.duplicate_name_question_rows=}"
+    )
     return payload
 
 
@@ -443,31 +490,34 @@ def _build_validation_corpus(
     rows: Sequence[DataPoint],
     field_key: str,
 ) -> _CorpusPayload:
-    """Builds unique corpus for one retrieval field."""
-    text_by_name: dict[str, str] = {}
+    """Builds deduplicated corpus for one retrieval field."""
+    unique_name_text_pairs: set[tuple[str, str]] = set()
+    names: list[str] = []
+    texts: list[str] = []
     empty_name_skips = 0
-    duplicate_name_skips = 0
+    duplicate_name_text_skips = 0
     empty_field_skips = 0
     for row in rows:
         name = row.name.strip()
         if not name:
             empty_name_skips += 1
             continue
-        if name in text_by_name:
-            duplicate_name_skips += 1
-            continue
         text = _text_for_field(row=row, field_key=field_key)
         if not text:
             empty_field_skips += 1
             continue
-        text_by_name[name] = text
-
-    names = list(text_by_name.keys())
-    texts = [text_by_name[name] for name in names]
+        dedup_key = (name.casefold(), text.casefold())
+        if dedup_key in unique_name_text_pairs:
+            duplicate_name_text_skips += 1
+            continue
+        unique_name_text_pairs.add(dedup_key)
+        names.append(name)
+        texts.append(text)
     payload = _CorpusPayload(texts=texts, names=names)
     log.info(
-        f"{field_key=}, parquet_rows={len(rows)}, unique_corpus_docs={len(texts)}, "
-        f"{empty_name_skips=}, {duplicate_name_skips=}, {empty_field_skips=}"
+        f"{field_key=}, parquet_rows={len(rows)}, "
+        f"unique_corpus_docs={len(payload.texts)}, "
+        f"{empty_name_skips=}, {duplicate_name_text_skips=}, {empty_field_skips=}"
     )
     return payload
 
@@ -1288,6 +1338,24 @@ def _is_port_in_use(port: int) -> bool:
         return sock.connect_ex(("127.0.0.1", port)) == 0
 
 
+def _pick_available_port(preferred_port: int) -> int:
+    """Returns preferred_port when free, else asks OS for a free port."""
+    if not _is_port_in_use(preferred_port):
+        log.info(f"{preferred_port=}, selected_requested_port=True")
+        return preferred_port
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        fallback_port = int(sock.getsockname()[1])
+    log.info(f"{preferred_port=}, {fallback_port=}, selected_requested_port=False")
+    return fallback_port
+
+
+def _build_vllm_base_url(vllm_port: int) -> str:
+    """Builds OpenAI-compatible base URL for local vLLM endpoint."""
+    return f"http://127.0.0.1:{vllm_port}/v1"
+
+
 def _probe_vllm_http_ready(
     probe_url: str, timeout_sec: float, api_key: str
 ) -> bool:
@@ -1351,16 +1419,17 @@ def _maybe_start_vllm_server(
     startup_timeout_sec: float = _VLLM_STARTUP_TIMEOUT_SEC,
     poll_interval_sec: float = _VLLM_STARTUP_POLL_INTERVAL_SEC,
     probe_timeout_sec: float = _VLLM_STARTUP_PROBE_TIMEOUT_SEC,
-) -> subprocess.Popen[bytes] | None:
+) -> _VllmStartupResult:
     """Starts vLLM server in the background when requested."""
     if not start_vllm_server:
-        return None
-
-    if _is_port_in_use(vllm_port):
-        raise RuntimeError(
-            f"Port {vllm_port} is already in use. "
-            "Stop the existing vLLM server before starting a new one."
+        return _VllmStartupResult(
+            process=None,
+            resolved_port=vllm_port,
+            resolved_base_url=vllm_base_url,
         )
+
+    resolved_port = _pick_available_port(preferred_port=vllm_port)
+    resolved_base_url = _build_vllm_base_url(vllm_port=resolved_port)
 
     command = [
         "uv",
@@ -1375,7 +1444,7 @@ def _maybe_start_vllm_server(
         "--max-model-len",
         "8192",
         "--port",
-        str(vllm_port),
+        str(resolved_port),
         "--host",
         "0.0.0.0",
     ]
@@ -1387,16 +1456,20 @@ def _maybe_start_vllm_server(
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    log.info(f"{command=}, {process.pid=}")
+    log.info(f"{command=}, {process.pid=}, {resolved_port=}, {resolved_base_url=}")
     _wait_for_vllm_server_ready(
         process=process,
-        vllm_base_url=vllm_base_url,
+        vllm_base_url=resolved_base_url,
         api_key=vllm_api_key,
         poll_interval_sec=poll_interval_sec,
         timeout_sec=startup_timeout_sec,
         probe_timeout_sec=probe_timeout_sec,
     )
-    return process
+    return _VllmStartupResult(
+        process=process,
+        resolved_port=resolved_port,
+        resolved_base_url=resolved_base_url,
+    )
 
 
 def _chroma_collection_doc_count(
@@ -1623,9 +1696,10 @@ def evaluate_validation_parquet(
     retrieval fields (summary and description). Dense metrics always run,
     and hybrid metrics (dense + BM25 via RRF) are enabled by default.
     """
-    if not vllm_base_url:
-        vllm_base_url = f"http://127.0.0.1:{vllm_port}/v1"
-    vllm_process = _maybe_start_vllm_server(
+    uses_default_base_url = not vllm_base_url
+    if uses_default_base_url:
+        vllm_base_url = _build_vllm_base_url(vllm_port=vllm_port)
+    vllm_startup = _maybe_start_vllm_server(
         model_name=retrieval_model,
         vllm_port=vllm_port,
         vllm_gpu_device=vllm_gpu_device,
@@ -1634,6 +1708,9 @@ def evaluate_validation_parquet(
         vllm_base_url=vllm_base_url,
         vllm_api_key=vllm_api_key,
     )
+    if start_vllm_server and uses_default_base_url:
+        vllm_base_url = vllm_startup.resolved_base_url
+    vllm_process = vllm_startup.process
     validation_payload = _load_validation_payload(validation_parquet=validation_parquet)
     validation_payload = _slice_validation_payload(
         payload=validation_payload,
@@ -1884,8 +1961,9 @@ def build_validation_indexes(
     use_hf_encoder: bool = False,
 ) -> dict[str, dict[str, int]]:
     """Builds and caches Chroma and BM25 artifacts for validation retrieval."""
-    if not vllm_base_url:
-        vllm_base_url = f"http://127.0.0.1:{vllm_port}/v1"
+    uses_default_base_url = not vllm_base_url
+    if uses_default_base_url:
+        vllm_base_url = _build_vllm_base_url(vllm_port=vllm_port)
     validation_payload = _load_validation_payload(validation_parquet=validation_parquet)
     output: dict[str, dict[str, int]] = {}
     all_cached = _all_chroma_collections_cached(
@@ -1916,7 +1994,7 @@ def build_validation_indexes(
         log.info(f"{output=}")
         return output
 
-    vllm_process = _maybe_start_vllm_server(
+    vllm_startup = _maybe_start_vllm_server(
         model_name=retrieval_model,
         vllm_port=vllm_port,
         vllm_gpu_device=vllm_gpu_device,
@@ -1925,6 +2003,9 @@ def build_validation_indexes(
         vllm_base_url=vllm_base_url,
         vllm_api_key=vllm_api_key,
     )
+    if start_vllm_server and uses_default_base_url:
+        vllm_base_url = vllm_startup.resolved_base_url
+    vllm_process = vllm_startup.process
     try:
         for field_config in VALIDATION_FIELD_CONFIGS:
             field_key = field_config.field_key

@@ -56,6 +56,13 @@ class _Bm25QueryResult(NamedTuple):
     scores: list[float]
 
 
+class _LoadedBm25Artifacts(NamedTuple):
+    """Loaded persisted payload and instantiated BM25 model."""
+
+    index: _Bm25PersistedIndex
+    model: BM25Okapi
+
+
 def tokenize(text: str, remove_stopwords: bool = True) -> list[str]:
     """Tokenizes text into lowercase alphanumeric terms."""
     terms = [token.lower() for token in _TOKEN_PATTERN.findall(text)]
@@ -102,14 +109,32 @@ def load_bm25_index(path: Path) -> _Bm25PersistedIndex:
     return index
 
 
-def bm25_search(index: _Bm25PersistedIndex, query: str, limit: int) -> _Bm25QueryResult:
+def create_bm25_model(index: _Bm25PersistedIndex) -> BM25Okapi:
+    """Creates a BM25 model from persisted tokenized documents."""
+    log.info(f"{len(index.tokenized_documents)=}")
+    return BM25Okapi(index.tokenized_documents)
+
+
+def load_bm25_artifacts(path: Path) -> _LoadedBm25Artifacts:
+    """Loads persisted BM25 payload and initializes model."""
+    index = load_bm25_index(path=path)
+    model = create_bm25_model(index=index)
+    return _LoadedBm25Artifacts(index=index, model=model)
+
+
+def bm25_search(
+    index: _Bm25PersistedIndex,
+    query: str,
+    limit: int,
+    model: BM25Okapi | None = None,
+) -> _Bm25QueryResult:
     """Runs sparse BM25 ranking for a query."""
     if not index.ids:
         return _Bm25QueryResult(ids=[], scores=[])
 
     tokenized_query = tokenize(query, remove_stopwords=index.remove_stopwords)
-    bm25 = BM25Okapi(index.tokenized_documents)
-    raw_scores = bm25.get_scores(tokenized_query)
+    resolved_model = model or create_bm25_model(index=index)
+    raw_scores = resolved_model.get_scores(tokenized_query)
 
     sorted_pairs = sorted(
         enumerate(raw_scores),
