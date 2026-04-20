@@ -41,6 +41,20 @@ EVAL_RUN_NAME ?= validation-parquet-eval
 EVAL_USE_HF_ENCODER ?= false
 EVAL_DENSE_MODELS ?= Qwen/Qwen3-Embedding-0.6B,Qwen/Qwen3-Embedding-4B,Qwen/Qwen3-Embedding-8B,vespa-engine/colbert,sentence-transformers/bert-large-nli-mean-tokens
 
+MINED_INPUT_PARQUET ?= artifacts/retriever_training/train.parquet
+MINED_OUTPUT_PARQUET ?= artifacts/retriever_training/training_data.parquet
+MINED_CHROMA_ROOT ?= artifacts/chroma_train_builder
+MINED_EMBEDDING_MODEL ?= Qwen/Qwen3-Embedding-0.6B
+MINED_BASE_URL ?= http://127.0.0.1:$(EMBD_PORT)/v1
+MINED_API_KEY ?= EMPTY
+MINED_EMBED_BATCH_SIZE ?= 256
+MINED_MAX_CONCURRENCY ?= 32
+MINED_RETRIEVAL_TOP_K ?= 37
+MINED_DROP_TOP_K ?= 5
+MINED_KEEP_NEGATIVES ?= 32
+MINED_RRF_K ?= 60
+MINED_INCLUDE_NEGATIVE_DESCRIPTIONS ?= false
+
 .PHONY: vllm-embd-serve
 vllm-embd-serve:
 	CUDA_VISIBLE_DEVICES=$(GPU_DEVICE) uv run vllm serve $(EMBD_MODEL) \
@@ -162,3 +176,20 @@ retriever-evaluate-two-gpu:
 		"$(EVAL_VAL_PARQUET)" \
 		"$(EVAL_WANDB_PROJECT)" \
 		"$(EVAL_WANDB_ENTITY)"
+
+.PHONY: build-mined-training-data
+build-mined-training-data:
+	uv run python -m ast_skills.train.generate_training_data \
+		--input_parquet $(MINED_INPUT_PARQUET) \
+		--output_parquet $(MINED_OUTPUT_PARQUET) \
+		--chroma_root_dir $(MINED_CHROMA_ROOT) \
+		--embedding_model $(MINED_EMBEDDING_MODEL) \
+		--embedding_base_url $(MINED_BASE_URL) \
+		--api_key $(MINED_API_KEY) \
+		--embedding_batch_size $(MINED_EMBED_BATCH_SIZE) \
+		--max_concurrency $(MINED_MAX_CONCURRENCY) \
+		--retrieval_top_k $(MINED_RETRIEVAL_TOP_K) \
+		--drop_top_k $(MINED_DROP_TOP_K) \
+		--keep_negatives $(MINED_KEEP_NEGATIVES) \
+		--rrf_k $(MINED_RRF_K) \
+		--include_negative_descriptions $(MINED_INCLUDE_NEGATIVE_DESCRIPTIONS)
