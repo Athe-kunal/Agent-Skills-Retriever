@@ -18,7 +18,7 @@ MINED_WINDOW_START ?= 6
 MINED_NEGATIVES_PER_ROW ?= 32
 MINED_RANDOM_SEED ?= 13
 MINED_VALIDATION_RATIO ?= 0.1
-MINED_MAX_CONCURRENCY ?= 16
+MINED_DATASET_MAX_CONCURRENCY ?= 16
 
 TRAIN_CONFIG_PATH ?= configs/train.config.yaml
 HF_DATASET_REPO_ID ?= Agent-Skills-Retriever
@@ -30,21 +30,21 @@ HF_MODEL_PATH ?= artifacts/sentence_transformers/qwen3-mined-negatives/checkpoin
 HF_TOKEN ?= 
 HF_PRIVATE ?= false
 
-MINED_INPUT_PARQUET ?= artifacts/retriever_training/train.parquet
-MINED_OUTPUT_PARQUET ?= artifacts/retriever_training/training_data.parquet
-MINED_CHROMA_ROOT ?= artifacts/chroma_train_builder
-MINED_EMBEDDING_MODEL ?= Qwen/Qwen3-Embedding-8B
-MINED_BASE_URL ?= http://127.0.0.1:$(EMBD_PORT)/v1
-MINED_API_KEY ?= EMPTY
-MINED_EMBED_BATCH_SIZE ?= 256
-MINED_MAX_CONCURRENCY ?= 256
-MINED_RETRIEVAL_TOP_K ?= 37
-MINED_DROP_TOP_K ?= 5
-MINED_KEEP_NEGATIVES ?= 32
-MINED_RRF_K ?= 60
-MINED_INCLUDE_NEGATIVE_DESCRIPTIONS ?= false
+TRAIN_DATA_INPUT_PARQUET ?= artifacts/retriever_training/train.parquet
+TRAIN_DATA_OUTPUT_PARQUET ?= artifacts/retriever_training/training_data.parquet
+TRAIN_DATA_CHROMA_ROOT ?= artifacts/chroma_train_builder
+TRAIN_DATA_EMBEDDING_MODEL ?= Qwen/Qwen3-Embedding-8B
+TRAIN_DATA_BASE_URL ?= http://127.0.0.1:$(EMBD_PORT)/v1
+TRAIN_DATA_API_KEY ?= EMPTY
+TRAIN_DATA_EMBED_BATCH_SIZE ?= 256
+TRAIN_DATA_MAX_CONCURRENCY ?= 256
+TRAIN_DATA_RETRIEVAL_TOP_K ?= 37
+TRAIN_DATA_DROP_TOP_K ?= 5
+TRAIN_DATA_KEEP_NEGATIVES ?= 32
+TRAIN_DATA_RRF_K ?= 60
+TRAIN_DATA_INCLUDE_NEGATIVE_DESCRIPTIONS ?= false
 
-EVAL_MODEL ?= /home/recoverx/astarag/AST-Based-Agent-Skills/artifacts/sentence_transformers/qwen3-mined-negatives/checkpoint-1410
+EVAL_MODEL ?= artifacts/sentence_transformers/qwen3-mined-negatives
 EVAL_VAL_PARQUET ?= artifacts/val.parquet
 EVAL_WANDB_PROJECT ?= ast-skills-retriever
 EVAL_VLLM_PORT ?= 8140
@@ -59,6 +59,25 @@ EVAL_RUN_NAME ?= validation-parquet-eval
 EVAL_USE_HF_ENCODER ?= false
 EVAL_MAX_VAL_ROWS ?= 0
 # Qwen/Qwen3-Embedding-0.6B,Qwen/Qwen3-Embedding-4B,Qwen/Qwen3-Embedding-8B,sentence-transformers/bert-large-nli-mean-tokens
+
+.PHONY: help
+help:
+	@echo "Common targets:"
+	@echo "  make build-retriever-chroma            # Build Chroma indexes from a parquet dataset."
+	@echo "  make build-mined-negatives-parquet     # Create train/validation parquet with mined negatives."
+	@echo "  make retriever-train                   # Train using TRAIN_CONFIG_PATH."
+	@echo "  make retriever-train-fsdp-2gpu         # Train with 2-GPU FSDP helper script."
+	@echo "  make retriever-evaluate                # Evaluate based on the train config."
+	@echo "  make retriever-evaluate-validation     # Evaluate retrieval on a validation parquet."
+	@echo "  make retriever-evaluate-validation-bm25# BM25-only validation baseline."
+	@echo "  make retriever-evaluate-model-sweep    # Sweep multiple dense models for validation."
+	@echo "  make retriever-evaluate-two-gpu        # Evaluate sweep across two GPUs."
+	@echo "  make build-mined-training-data         # Build hard-negative training data from train parquet."
+	@echo "  make hf-upload-dataset                 # Upload train/val/test parquet files to Hugging Face."
+	@echo "  make hf-upload-model                   # Upload a local model directory to Hugging Face."
+	@echo ""
+	@echo "Run with overridden variables, for example:"
+	@echo "  make retriever-train TRAIN_CONFIG_PATH=configs/train.config.yaml"
 
 .PHONY: vllm-embd-serve
 vllm-embd-serve:
@@ -91,7 +110,7 @@ build-mined-negatives-parquet:
 		--api_key $(EMBD_API_KEY) \
 		--random_seed $(MINED_RANDOM_SEED) \
 		--validation_ratio $(MINED_VALIDATION_RATIO) \
-		--max_concurrency $(MINED_MAX_CONCURRENCY) \
+		--max_concurrency $(MINED_DATASET_MAX_CONCURRENCY) \
 		--retrieval_pool_size $(MINED_RETRIEVAL_POOL_SIZE) \
 		--window_start_rank $(MINED_WINDOW_START) \
 		--negatives_per_row $(MINED_NEGATIVES_PER_ROW)
@@ -108,7 +127,7 @@ retriever-train-fsdp-2gpu:
 .PHONY: retriever-evaluate
 retriever-evaluate:
 	uv run python -m ast_skills.evaluation.evaluate_retriever evaluate_from_config \
-		--config_path configs/train.yaml
+		--config_path $(TRAIN_CONFIG_PATH)
 
 .PHONY: retriever-evaluate-validation
 retriever-evaluate-validation:
@@ -167,19 +186,19 @@ retriever-evaluate-two-gpu:
 .PHONY: build-mined-training-data
 build-mined-training-data:
 	uv run python -m ast_skills.train.generate_training_data \
-		--input_parquet $(MINED_INPUT_PARQUET) \
-		--output_parquet $(MINED_OUTPUT_PARQUET) \
-		--chroma_root_dir $(MINED_CHROMA_ROOT) \
-		--embedding_model $(MINED_EMBEDDING_MODEL) \
-		--embedding_base_url $(MINED_BASE_URL) \
-		--api_key $(MINED_API_KEY) \
-		--embedding_batch_size $(MINED_EMBED_BATCH_SIZE) \
-		--max_concurrency $(MINED_MAX_CONCURRENCY) \
-		--retrieval_top_k $(MINED_RETRIEVAL_TOP_K) \
-		--drop_top_k $(MINED_DROP_TOP_K) \
-		--keep_negatives $(MINED_KEEP_NEGATIVES) \
-		--rrf_k $(MINED_RRF_K) \
-		--include_negative_descriptions $(MINED_INCLUDE_NEGATIVE_DESCRIPTIONS)
+		--input_parquet $(TRAIN_DATA_INPUT_PARQUET) \
+		--output_parquet $(TRAIN_DATA_OUTPUT_PARQUET) \
+		--chroma_root_dir $(TRAIN_DATA_CHROMA_ROOT) \
+		--embedding_model $(TRAIN_DATA_EMBEDDING_MODEL) \
+		--embedding_base_url $(TRAIN_DATA_BASE_URL) \
+		--api_key $(TRAIN_DATA_API_KEY) \
+		--embedding_batch_size $(TRAIN_DATA_EMBED_BATCH_SIZE) \
+		--max_concurrency $(TRAIN_DATA_MAX_CONCURRENCY) \
+		--retrieval_top_k $(TRAIN_DATA_RETRIEVAL_TOP_K) \
+		--drop_top_k $(TRAIN_DATA_DROP_TOP_K) \
+		--keep_negatives $(TRAIN_DATA_KEEP_NEGATIVES) \
+		--rrf_k $(TRAIN_DATA_RRF_K) \
+		--include_negative_descriptions $(TRAIN_DATA_INCLUDE_NEGATIVE_DESCRIPTIONS)
 
 .PHONY: hf-upload-dataset
 hf-upload-dataset:
