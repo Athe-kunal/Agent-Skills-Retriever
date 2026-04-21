@@ -7,12 +7,12 @@ model:
 
 training:
   epochs: 3
-  batch_size: 4
-  gradient_accumulation_steps: 1
+  batch_size: 32
+  gradient_accumulation_steps: 4
   learning_rate: 2.0e-5
   warmup_steps: 200
   evaluation_steps: 200
-  checkpoint_save_steps: 1000
+  checkpoint_save_steps: 500
   seed: 13
   use_hard_negatives: true
   triplet_margin: 0.2
