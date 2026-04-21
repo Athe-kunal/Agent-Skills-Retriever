@@ -11,6 +11,7 @@ import fire
 import numpy as np
 import pandas as pd
 import torch
+import torch.distributed as dist
 import wandb
 import yaml
 from datasets import Dataset
@@ -343,13 +344,7 @@ def _compute_validation_metrics(
 ) -> dict[str, float]:
     """Computes retrieval metrics on validation parquet rows."""
     if not dataset.queries or not dataset.documents:
-        return {
-            "eval/hit@1": 0.0,
-            "eval/hit@3": 0.0,
-            "eval/hit@5": 0.0,
-            "eval/hit@10": 0.0,
-            "eval/mrr": 0.0,
-        }
+        return _empty_validation_metrics()
 
     query_embeddings = model.encode(dataset.queries, normalize_embeddings=True, convert_to_numpy=True)
     document_embeddings = model.encode(
@@ -382,6 +377,71 @@ def _compute_validation_metrics(
     return metrics
 
 
+def _empty_validation_metrics() -> dict[str, float]:
+    """Builds the zeroed validation metrics payload."""
+    return {
+        "eval/hit@1": 0.0,
+        "eval/hit@3": 0.0,
+        "eval/hit@5": 0.0,
+        "eval/hit@10": 0.0,
+        "eval/mrr": 0.0,
+    }
+
+
+def _is_main_distributed_process() -> bool:
+    """Returns true when this process is rank 0 or single-process."""
+    if not dist.is_available() or not dist.is_initialized():
+        return True
+    is_main_process = dist.get_rank() == 0
+    log.info(f"{is_main_process=}")
+    return is_main_process
+
+
+def _clear_gradients(module: torch.nn.Module) -> None:
+    """Clears gradients on a module before FSDP full-parameter materialization."""
+    cleared_gradients = 0
+    for parameter in module.parameters():
+        if parameter.grad is None:
+            continue
+        parameter.grad = None
+        cleared_gradients += 1
+    log.info(f"{cleared_gradients=}")
+
+
+def _is_fsdp_wrapped_model(model: Any) -> bool:
+    """Checks whether the incoming model is wrapped by torch FSDP."""
+    module_name = model.__class__.__module__
+    class_name = model.__class__.__name__
+    is_fsdp_module = module_name.startswith("torch.distributed.fsdp")
+    is_fsdp_class = class_name == "FullyShardedDataParallel"
+    is_fsdp_model = is_fsdp_module and is_fsdp_class
+    log.info(f"{module_name=}, {class_name=}, {is_fsdp_model=}")
+    return is_fsdp_model
+
+
+def _compute_validation_metrics_for_trainer_model(
+    model: Any,
+    dataset: _RetrievalDataset,
+) -> dict[str, float]:
+    """Computes validation metrics for either plain or FSDP-wrapped models."""
+    if not _is_fsdp_wrapped_model(model):
+        return _compute_validation_metrics(model=model, dataset=dataset)
+
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    _clear_gradients(model)
+    with FSDP.summon_full_params(
+        model,
+        writeback=False,
+        offload_to_cpu=True,
+        rank0_only=True,
+    ):
+        if not _is_main_distributed_process():
+            return _empty_validation_metrics()
+        sentence_transformer_model = model.module
+        return _compute_validation_metrics(model=sentence_transformer_model, dataset=dataset)
+
+
 class _ParquetValidationEvaluator(SentenceEvaluator):
     """Sentence-transformer evaluator for parquet-based retrieval metrics."""
 
@@ -399,7 +459,10 @@ class _ParquetValidationEvaluator(SentenceEvaluator):
         steps: int = -1,
     ) -> float:
         del output_path
-        metrics = _compute_validation_metrics(model=model, dataset=self._validation_dataset)
+        metrics = _compute_validation_metrics_for_trainer_model(
+            model=model,
+            dataset=self._validation_dataset,
+        )
         metrics["eval/epoch"] = float(epoch)
         metrics["eval/steps"] = float(steps)
         if self._use_wandb and wandb.run is not None:
@@ -471,6 +534,10 @@ class _FSDPSentenceTransformerTrainer(SentenceTransformerTrainer):
             unwrapped_model.save_pretrained(resolved_dir, state_dict=fsdp_full_state_dict)
             torch.save(self.args, os.path.join(resolved_dir, "training_args.bin"))
         log.info(f"{resolved_dir=}")
+
+    def _clear_model_gradients(self) -> None:
+        """Clears model gradients before FSDP full-parameter save."""
+        _clear_gradients(self.model)
 
 
 def _build_training_args(config: TrainConfig) -> SentenceTransformerTrainingArguments:
