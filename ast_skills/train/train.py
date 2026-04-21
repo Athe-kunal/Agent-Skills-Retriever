@@ -11,6 +11,7 @@ import fire
 import numpy as np
 import pandas as pd
 import torch
+import torch.distributed as dist
 import wandb
 import yaml
 from datasets import Dataset
@@ -52,6 +53,7 @@ class TrainConfig:
     learning_rate: float = 2e-5
     warmup_steps: int = 200
     evaluation_steps: int = 200
+    save_strategy: str = "epoch"
     checkpoint_save_steps: int = 200
     seed: int = 13
     use_hard_negatives: bool = True
@@ -99,6 +101,16 @@ def _parse_bool(value: Any, default: bool) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     return default
+
+
+def _parse_save_strategy(value: Any, default: str = "epoch") -> str:
+    """Parses and validates checkpoint save strategy."""
+    normalized_value = str(value or default).strip().lower()
+    if normalized_value in {"epoch", "steps"}:
+        log.info(f"{normalized_value=}")
+        return normalized_value
+
+    raise ValueError("`save_strategy` must be either 'epoch' or 'steps'.")
 
 
 def _train_kwargs_from_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -168,6 +180,7 @@ def _train_config_from_nested_config(config: dict[str, Any]) -> TrainConfig:
         learning_rate=float(training_config.get("learning_rate", 2e-5)),
         warmup_steps=int(training_config.get("warmup_steps", 200)),
         evaluation_steps=int(training_config.get("evaluation_steps", 200)),
+        save_strategy=_parse_save_strategy(training_config.get("save_strategy", "epoch")),
         checkpoint_save_steps=int(training_config.get("checkpoint_save_steps", 200)),
         seed=int(training_config.get("seed", 13)),
         use_hard_negatives=_parse_bool(training_config.get("use_hard_negatives", True), default=True),
@@ -331,13 +344,7 @@ def _compute_validation_metrics(
 ) -> dict[str, float]:
     """Computes retrieval metrics on validation parquet rows."""
     if not dataset.queries or not dataset.documents:
-        return {
-            "eval/hit@1": 0.0,
-            "eval/hit@3": 0.0,
-            "eval/hit@5": 0.0,
-            "eval/hit@10": 0.0,
-            "eval/mrr": 0.0,
-        }
+        return _empty_validation_metrics()
 
     query_embeddings = model.encode(dataset.queries, normalize_embeddings=True, convert_to_numpy=True)
     document_embeddings = model.encode(
@@ -370,6 +377,71 @@ def _compute_validation_metrics(
     return metrics
 
 
+def _empty_validation_metrics() -> dict[str, float]:
+    """Builds the zeroed validation metrics payload."""
+    return {
+        "eval/hit@1": 0.0,
+        "eval/hit@3": 0.0,
+        "eval/hit@5": 0.0,
+        "eval/hit@10": 0.0,
+        "eval/mrr": 0.0,
+    }
+
+
+def _is_main_distributed_process() -> bool:
+    """Returns true when this process is rank 0 or single-process."""
+    if not dist.is_available() or not dist.is_initialized():
+        return True
+    is_main_process = dist.get_rank() == 0
+    log.info(f"{is_main_process=}")
+    return is_main_process
+
+
+def _clear_gradients(module: torch.nn.Module) -> None:
+    """Clears gradients on a module before FSDP full-parameter materialization."""
+    cleared_gradients = 0
+    for parameter in module.parameters():
+        if parameter.grad is None:
+            continue
+        parameter.grad = None
+        cleared_gradients += 1
+    log.info(f"{cleared_gradients=}")
+
+
+def _is_fsdp_wrapped_model(model: Any) -> bool:
+    """Checks whether the incoming model is wrapped by torch FSDP."""
+    module_name = model.__class__.__module__
+    class_name = model.__class__.__name__
+    is_fsdp_module = module_name.startswith("torch.distributed.fsdp")
+    is_fsdp_class = class_name == "FullyShardedDataParallel"
+    is_fsdp_model = is_fsdp_module and is_fsdp_class
+    log.info(f"{module_name=}, {class_name=}, {is_fsdp_model=}")
+    return is_fsdp_model
+
+
+def _compute_validation_metrics_for_trainer_model(
+    model: Any,
+    dataset: _RetrievalDataset,
+) -> dict[str, float]:
+    """Computes validation metrics for either plain or FSDP-wrapped models."""
+    if not _is_fsdp_wrapped_model(model):
+        return _compute_validation_metrics(model=model, dataset=dataset)
+
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    _clear_gradients(model)
+    with FSDP.summon_full_params(
+        model,
+        writeback=False,
+        offload_to_cpu=True,
+        rank0_only=True,
+    ):
+        if not _is_main_distributed_process():
+            return _empty_validation_metrics()
+        sentence_transformer_model = model.module
+        return _compute_validation_metrics(model=sentence_transformer_model, dataset=dataset)
+
+
 class _ParquetValidationEvaluator(SentenceEvaluator):
     """Sentence-transformer evaluator for parquet-based retrieval metrics."""
 
@@ -387,7 +459,10 @@ class _ParquetValidationEvaluator(SentenceEvaluator):
         steps: int = -1,
     ) -> float:
         del output_path
-        metrics = _compute_validation_metrics(model=model, dataset=self._validation_dataset)
+        metrics = _compute_validation_metrics_for_trainer_model(
+            model=model,
+            dataset=self._validation_dataset,
+        )
         metrics["eval/epoch"] = float(epoch)
         metrics["eval/steps"] = float(steps)
         if self._use_wandb and wandb.run is not None:
@@ -428,8 +503,9 @@ class _FSDPSentenceTransformerTrainer(SentenceTransformerTrainer):
     and model card generation also calls model.encode() on the sharded model,
     causing the same RuntimeError on every checkpoint write.
 
-    The fix: FSDP.summon_full_params temporarily all-gathers every shard onto
-    rank 0 before calling save_pretrained, then reshards when the context exits.
+    The fix: clear stale gradients and use ``FSDP.summon_full_params`` while
+    saving on rank 0. Clearing gradients avoids FSDP grad-view assertion
+    failures when sharded views are restored after checkpoint export.
     """
 
     def _save(self, output_dir: str | None = None, state_dict=None) -> None:
@@ -442,6 +518,7 @@ class _FSDPSentenceTransformerTrainer(SentenceTransformerTrainer):
 
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
+        self._clear_model_gradients()
         with FSDP.summon_full_params(
             self.model,
             writeback=False,
@@ -454,6 +531,10 @@ class _FSDPSentenceTransformerTrainer(SentenceTransformerTrainer):
                 torch.save(self.args, os.path.join(resolved_dir, "training_args.bin"))
         log.info(f"{resolved_dir=}")
 
+    def _clear_model_gradients(self) -> None:
+        """Clears model gradients before FSDP full-parameter save."""
+        _clear_gradients(self.model)
+
 
 def _build_training_args(config: TrainConfig) -> SentenceTransformerTrainingArguments:
     """Builds SentenceTransformerTrainingArguments from TrainConfig."""
@@ -463,6 +544,8 @@ def _build_training_args(config: TrainConfig) -> SentenceTransformerTrainingArgu
         f"{config.bf16=}, {config.gradient_checkpointing=}, {config.fsdp_mode=}"
     )
     fsdp_mode, fsdp_config = _build_fsdp_config(config)
+    save_steps = config.checkpoint_save_steps if config.save_strategy == "steps" else None
+    log.info(f"{config.save_strategy=}, {config.checkpoint_save_steps=}, {save_steps=}")
     return SentenceTransformerTrainingArguments(
         output_dir=config.output_dir,
         num_train_epochs=config.epochs,
@@ -471,7 +554,8 @@ def _build_training_args(config: TrainConfig) -> SentenceTransformerTrainingArgu
         warmup_steps=config.warmup_steps,
         eval_strategy="steps",
         eval_steps=config.evaluation_steps,
-        save_strategy="epoch",
+        save_strategy=config.save_strategy,
+        save_steps=save_steps,
         save_total_limit=None,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         bf16=config.bf16,
@@ -516,6 +600,7 @@ def train(
     learning_rate: float = 2e-5,
     warmup_steps: int = 200,
     evaluation_steps: int = 200,
+    save_strategy: str = "epoch",
     checkpoint_save_steps: int = 200,
     seed: int = 13,
     use_hard_negatives: bool = True,
@@ -544,6 +629,7 @@ def train(
         learning_rate=learning_rate,
         warmup_steps=warmup_steps,
         evaluation_steps=evaluation_steps,
+        save_strategy=_parse_save_strategy(save_strategy),
         checkpoint_save_steps=checkpoint_save_steps,
         seed=seed,
         use_hard_negatives=use_hard_negatives,
