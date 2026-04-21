@@ -21,6 +21,8 @@ MINED_VALIDATION_RATIO ?= 0.1
 MINED_MAX_CONCURRENCY ?= 16
 
 TRAIN_CONFIG_PATH ?= configs/train.config.yaml
+HF_DATASET_UPLOAD_CONFIG ?= configs/hf_dataset_upload.json
+HF_MODEL_UPLOAD_CONFIG ?= configs/hf_model_upload.json
 
 MINED_INPUT_PARQUET ?= artifacts/retriever_training/train.parquet
 MINED_OUTPUT_PARQUET ?= artifacts/retriever_training/training_data.parquet
@@ -172,3 +174,13 @@ build-mined-training-data:
 		--keep_negatives $(MINED_KEEP_NEGATIVES) \
 		--rrf_k $(MINED_RRF_K) \
 		--include_negative_descriptions $(MINED_INCLUDE_NEGATIVE_DESCRIPTIONS)
+
+.PHONY: hf-upload-dataset
+hf-upload-dataset:
+	uv run python -m ast_skills.common.huggingface_uploader upload_dataset \
+		--config_path $(HF_DATASET_UPLOAD_CONFIG)
+
+.PHONY: hf-upload-model
+hf-upload-model:
+	uv run python -m ast_skills.common.huggingface_uploader upload_model \
+		--config_path $(HF_MODEL_UPLOAD_CONFIG)
