@@ -61,7 +61,7 @@ The training config is split into sections:
 - `input.mined_parquet_path`
 - `input.validation_parquet_path` (optional validation metrics dataset)
 - `model.name`
-- `training.{epochs,batch_size,global_batch_size,learning_rate,warmup_steps,evaluation_steps,checkpoint_save_steps,seed}`
+- `training.{epochs,batch_size,global_batch_size,learning_rate,warmup_steps,evaluation_steps,checkpoint_save_steps,seed,gradient_checkpointing,bf16,fsdp_mode}`
 - `output.dir`
 - `logging.use_wandb` (default `true`) plus optional W&B metadata
 
@@ -69,6 +69,30 @@ The training config is split into sections:
 `batch_size`, gradient accumulation is enabled automatically with:
 
 `gradient_accumulation_steps = ceil(global_batch_size / batch_size)`
+
+### OOM quick notes
+
+If you hit OOM before a single forward pass, the most common cause is
+`batch_size` being too large for your GPU memory. For this repo, start with:
+
+- `training.batch_size: 4`
+- `training.gradient_checkpointing: true`
+- `training.bf16: true` (only if your GPUs support bf16)
+
+### 2-GPU FSDP training (Accelerate)
+
+Enable FSDP in config:
+
+```yaml
+training:
+  fsdp_mode: full_shard
+```
+
+Then launch:
+
+```bash
+make retriever-train-fsdp-2gpu TRAIN_CONFIG_PATH=configs/train.config.yaml GPU_IDS=0,1
+```
 
 Default config files:
 - `configs/train.config.yaml`

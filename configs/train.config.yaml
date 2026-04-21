@@ -18,6 +18,10 @@ training:
   triplet_margin: 0.2
   bf16: true
   gradient_checkpointing: true
+  fsdp_mode: ""
+  fsdp_use_orig_params: true
+  fsdp_cpu_ram_efficient_loading: true
+  fsdp_activation_checkpointing: false
   dataloader_num_workers: 4
 
 output:
