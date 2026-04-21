@@ -12,6 +12,7 @@ training:
   learning_rate: 2.0e-5
   warmup_steps: 200
   evaluation_steps: 200
+  save_strategy: steps
   checkpoint_save_steps: 1
   seed: 13
   use_hard_negatives: true

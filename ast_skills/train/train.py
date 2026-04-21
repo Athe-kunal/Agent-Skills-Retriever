@@ -52,6 +52,7 @@ class TrainConfig:
     learning_rate: float = 2e-5
     warmup_steps: int = 200
     evaluation_steps: int = 200
+    save_strategy: str = "epoch"
     checkpoint_save_steps: int = 200
     seed: int = 13
     use_hard_negatives: bool = True
@@ -99,6 +100,16 @@ def _parse_bool(value: Any, default: bool) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     return default
+
+
+def _parse_save_strategy(value: Any, default: str = "epoch") -> str:
+    """Parses and validates checkpoint save strategy."""
+    normalized_value = str(value or default).strip().lower()
+    if normalized_value in {"epoch", "steps"}:
+        log.info(f"{normalized_value=}")
+        return normalized_value
+
+    raise ValueError("`save_strategy` must be either 'epoch' or 'steps'.")
 
 
 def _train_kwargs_from_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -168,6 +179,7 @@ def _train_config_from_nested_config(config: dict[str, Any]) -> TrainConfig:
         learning_rate=float(training_config.get("learning_rate", 2e-5)),
         warmup_steps=int(training_config.get("warmup_steps", 200)),
         evaluation_steps=int(training_config.get("evaluation_steps", 200)),
+        save_strategy=_parse_save_strategy(training_config.get("save_strategy", "epoch")),
         checkpoint_save_steps=int(training_config.get("checkpoint_save_steps", 200)),
         seed=int(training_config.get("seed", 13)),
         use_hard_negatives=_parse_bool(training_config.get("use_hard_negatives", True), default=True),
@@ -469,6 +481,8 @@ def _build_training_args(config: TrainConfig) -> SentenceTransformerTrainingArgu
         f"{config.bf16=}, {config.gradient_checkpointing=}, {config.fsdp_mode=}"
     )
     fsdp_mode, fsdp_config = _build_fsdp_config(config)
+    save_steps = config.checkpoint_save_steps if config.save_strategy == "steps" else None
+    log.info(f"{config.save_strategy=}, {config.checkpoint_save_steps=}, {save_steps=}")
     return SentenceTransformerTrainingArguments(
         output_dir=config.output_dir,
         num_train_epochs=config.epochs,
@@ -477,7 +491,8 @@ def _build_training_args(config: TrainConfig) -> SentenceTransformerTrainingArgu
         warmup_steps=config.warmup_steps,
         eval_strategy="steps",
         eval_steps=config.evaluation_steps,
-        save_strategy="epoch",
+        save_strategy=config.save_strategy,
+        save_steps=save_steps,
         save_total_limit=None,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         bf16=config.bf16,
@@ -522,6 +537,7 @@ def train(
     learning_rate: float = 2e-5,
     warmup_steps: int = 200,
     evaluation_steps: int = 200,
+    save_strategy: str = "epoch",
     checkpoint_save_steps: int = 200,
     seed: int = 13,
     use_hard_negatives: bool = True,
@@ -550,6 +566,7 @@ def train(
         learning_rate=learning_rate,
         warmup_steps=warmup_steps,
         evaluation_steps=evaluation_steps,
+        save_strategy=_parse_save_strategy(save_strategy),
         checkpoint_save_steps=checkpoint_save_steps,
         seed=seed,
         use_hard_negatives=use_hard_negatives,
