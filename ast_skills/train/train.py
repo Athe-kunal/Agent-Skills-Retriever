@@ -346,9 +346,11 @@ def _compute_validation_metrics(
     if not dataset.queries or not dataset.documents:
         return _empty_validation_metrics()
 
-    query_embeddings = model.encode(dataset.queries, normalize_embeddings=True, convert_to_numpy=True)
+    query_embeddings = model.encode(
+        dataset.queries, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=True
+    )
     document_embeddings = model.encode(
-        dataset.documents, normalize_embeddings=True, convert_to_numpy=True
+        dataset.documents, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=True
     )
     similarity_matrix = np.matmul(query_embeddings, document_embeddings.T)
 
@@ -433,7 +435,7 @@ def _compute_validation_metrics_for_trainer_model(
     with FSDP.summon_full_params(
         model,
         writeback=False,
-        offload_to_cpu=True,
+        offload_to_cpu=False,
         rank0_only=True,
     ):
         if not _is_main_distributed_process():
@@ -453,7 +455,7 @@ class _ParquetValidationEvaluator(SentenceEvaluator):
 
     def __call__(
         self,
-        model: SentenceTransformer,
+        model: Any,
         output_path: str | None = None,
         epoch: int = -1,
         steps: int = -1,
@@ -503,9 +505,11 @@ class _FSDPSentenceTransformerTrainer(SentenceTransformerTrainer):
     and model card generation also calls model.encode() on the sharded model,
     causing the same RuntimeError on every checkpoint write.
 
-    The fix: build a full CPU state_dict via FSDP state-dict APIs and pass that
-    state_dict into save_pretrained(). This avoids touching sharded parameter
-    views during save and prevents FSDP grad-view assertion failures.
+    The fix: FSDP.summon_full_params temporarily all-gathers every shard onto
+    rank 0 before calling save_pretrained, then reshards when the context exits.
+    SentenceTransformer.save_pretrained does not accept a state_dict argument,
+    so the state-dict-based approach used by the base HuggingFace Trainer does
+    not apply here.
     """
 
     def _save(self, output_dir: str | None = None, state_dict=None) -> None:
@@ -516,23 +520,23 @@ class _FSDPSentenceTransformerTrainer(SentenceTransformerTrainer):
             super()._save(resolved_dir, state_dict=state_dict)
             return
 
+        # SentenceTransformer.save_pretrained does not accept a state_dict arg.
+        # summon_full_params temporarily all-gathers every FSDP shard onto rank 0
+        # (kept on GPU so model buffers and parameters share the same device for
+        # model.encode() called during model card generation). Resharding happens
+        # automatically on context exit.
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        from torch.distributed.fsdp import FullStateDictConfig
-        from torch.distributed.fsdp import StateDictType
 
-        full_state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(
+        with FSDP.summon_full_params(
             self.model,
-            StateDictType.FULL_STATE_DICT,
-            full_state_dict_config,
+            writeback=False,
+            offload_to_cpu=False,
+            rank0_only=True,
         ):
-            fsdp_full_state_dict = self.model.state_dict()
-        log.info(f"{resolved_dir=}, {len(fsdp_full_state_dict)=}")
-
-        if self.accelerator.is_main_process:
-            unwrapped_model = self.accelerator.unwrap_model(self.model)
-            unwrapped_model.save_pretrained(resolved_dir, state_dict=fsdp_full_state_dict)
-            torch.save(self.args, os.path.join(resolved_dir, "training_args.bin"))
+            if self.accelerator.is_main_process:
+                unwrapped_model = self.accelerator.unwrap_model(self.model)
+                unwrapped_model.save_pretrained(resolved_dir)
+                torch.save(self.args, os.path.join(resolved_dir, "training_args.bin"))
         log.info(f"{resolved_dir=}")
 
     def _clear_model_gradients(self) -> None:
@@ -559,7 +563,7 @@ def _build_training_args(config: TrainConfig) -> SentenceTransformerTrainingArgu
         eval_strategy="steps",
         eval_steps=config.evaluation_steps,
         save_strategy=config.save_strategy,
-        save_steps=save_steps,
+        save_steps=save_steps,  # type: ignore[arg-type]  # None is valid when save_strategy="epoch"
         save_total_limit=None,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         bf16=config.bf16,
