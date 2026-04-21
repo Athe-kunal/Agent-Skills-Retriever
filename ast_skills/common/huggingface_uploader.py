@@ -1,282 +1,142 @@
-"""Utilities to upload datasets and models to Hugging Face Hub."""
+"""Simple Hugging Face upload helpers for dataset splits and model artifacts."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from typing import Any, NamedTuple
 
 import fire
 from huggingface_hub import HfApi
 from loguru import logger as log
 
-from ast_skills.common.datamodels import (
-    DatasetUploadConfig,
-    JsonValue,
-    ModelCheckpointUploadItem,
-    ModelUploadConfig,
-    ParquetUploadItem,
-)
+
+def _validate_existing_file(file_path: str) -> Path:
+    """Validates that a path exists and points to a file."""
+    resolved_path = Path(file_path).expanduser().resolve()
+    log.info(f"{file_path=}, {resolved_path=}")
+    if not resolved_path.is_file():
+        raise ValueError(f"Expected file path but found: {resolved_path}")
+    return resolved_path
 
 
-class _UploadSummary(NamedTuple):
-    """Tracks uploaded repository paths for reporting."""
-
-    uploaded_paths: list[str]
-    metadata_path: str | None = None
-
-
-def _to_posix_path(value: str) -> str:
-    """Converts a path to a normalized POSIX string."""
-    posix_path = Path(value).as_posix().lstrip("./")
-    log.info(f"{value=}, {posix_path=}")
-    return posix_path
+def _validate_existing_directory(directory_path: str) -> Path:
+    """Validates that a path exists and points to a directory."""
+    resolved_path = Path(directory_path).expanduser().resolve()
+    log.info(f"{directory_path=}, {resolved_path=}")
+    if not resolved_path.is_dir():
+        raise ValueError(f"Expected directory path but found: {resolved_path}")
+    return resolved_path
 
 
-def _validate_existing_file(path: str) -> Path:
-    """Validates that ``path`` exists and points to a file."""
-    file_path = Path(path).expanduser().resolve()
-    log.info(f"{path=}, {file_path=}")
-    if not file_path.is_file():
-        raise ValueError(f"Expected a file, but found: {file_path}")
-    return file_path
-
-
-def _validate_existing_directory(path: str) -> Path:
-    """Validates that ``path`` exists and points to a directory."""
-    directory_path = Path(path).expanduser().resolve()
-    log.info(f"{path=}, {directory_path=}")
-    if not directory_path.is_dir():
-        raise ValueError(f"Expected a directory, but found: {directory_path}")
-    return directory_path
-
-
-def _create_dataset_metadata_payload(items: list[ParquetUploadItem]) -> dict[str, Any]:
-    """Builds a metadata payload for parquet artifacts."""
-    dataset_rows: list[dict[str, Any]] = []
-    for item in items:
-        dataset_row = {
-            "path_in_repo": _to_posix_path(item.path_in_repo),
-            "split": item.split,
-            "metadata": dict(item.metadata),
-        }
-        dataset_rows.append(dataset_row)
-    metadata_payload = {"parquet_items": dataset_rows}
-    log.info(f"{metadata_payload=}")
-    return metadata_payload
-
-
-def _write_json_temp_file(payload: dict[str, Any]) -> Path:
-    """Writes ``payload`` to a temporary JSON file and returns its path."""
-    temp_path = Path("/tmp/hf_dataset_metadata.json")
-    temp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    log.info(f"{temp_path=}")
-    return temp_path
-
-
-def _ensure_repo_exists(
+def _create_or_get_repo(
     api: HfApi,
     repo_id: str,
     repo_type: str,
     private: bool,
     token: str | None,
 ) -> None:
-    """Creates a repository if needed."""
+    """Creates the Hugging Face repository when it does not exist."""
     log.info(f"{repo_id=}, {repo_type=}, {private=}")
     api.create_repo(repo_id=repo_id, repo_type=repo_type, private=private, exist_ok=True, token=token)
 
 
-def upload_dataset_parquet_files(config: DatasetUploadConfig) -> _UploadSummary:
-    """Uploads parquet files and metadata to a Hugging Face dataset repository."""
-    log.info(f"{config=}")
-    api = HfApi(token=config.token)
-    _ensure_repo_exists(
-        api=api,
-        repo_id=config.repo_id,
-        repo_type="dataset",
-        private=config.private,
-        token=config.token,
-    )
-
-    uploaded_paths: list[str] = []
-    for item in config.parquet_items:
-        local_file_path = _validate_existing_file(item.local_file_path)
-        path_in_repo = _to_posix_path(item.path_in_repo)
-        api.upload_file(
-            path_or_fileobj=str(local_file_path),
-            path_in_repo=path_in_repo,
-            repo_id=config.repo_id,
-            repo_type="dataset",
-            commit_message=config.commit_message,
-            token=config.token,
-        )
-        uploaded_paths.append(path_in_repo)
-        log.info(f"{local_file_path=}, {path_in_repo=}")
-
-    metadata_payload = _create_dataset_metadata_payload(config.parquet_items)
-    metadata_file_path = _write_json_temp_file(metadata_payload)
-    metadata_path_in_repo = _to_posix_path(config.metadata_path_in_repo)
-    api.upload_file(
-        path_or_fileobj=str(metadata_file_path),
-        path_in_repo=metadata_path_in_repo,
-        repo_id=config.repo_id,
-        repo_type="dataset",
-        commit_message=config.commit_message,
-        token=config.token,
-    )
-    log.info(f"{metadata_path_in_repo=}")
-    return _UploadSummary(uploaded_paths=uploaded_paths, metadata_path=metadata_path_in_repo)
-
-
-def _upload_checkpoint_items(
-    api: HfApi,
-    config: ModelUploadConfig,
-    uploaded_paths: list[str],
+def upload_dataset_splits(
+    dataset_repo_id: str,
+    train_parquet_path: str,
+    validation_parquet_path: str,
+    test_parquet_path: str,
+    token: str | None = None,
+    private: bool = False,
+    commit_message: str = "Upload dataset train/validation/test parquet splits",
 ) -> None:
-    """Uploads checkpoint directories to a Hugging Face model repository."""
-    checkpoint_item: ModelCheckpointUploadItem
-    for checkpoint_item in config.checkpoint_items:
-        local_checkpoint_path = _validate_existing_directory(checkpoint_item.local_checkpoint_path)
-        path_in_repo = _to_posix_path(checkpoint_item.path_in_repo)
-        api.upload_folder(
-            folder_path=str(local_checkpoint_path),
-            path_in_repo=path_in_repo,
-            repo_id=config.repo_id,
-            repo_type="model",
-            commit_message=config.commit_message,
-            token=config.token,
-        )
-        uploaded_paths.append(path_in_repo)
-        log.info(f"{local_checkpoint_path=}, {path_in_repo=}")
+    """Uploads train/validation/test parquet files to a Hugging Face dataset repo.
 
+    Args:
+      dataset_repo_id: Dataset repository on Hugging Face Hub.
+      train_parquet_path: Local path to train parquet file.
+      validation_parquet_path: Local path to validation parquet file.
+      test_parquet_path: Local path to test parquet file.
+      token: Optional Hugging Face token.
+      private: Whether the repository should be private.
+      commit_message: Commit message used for uploads.
+    """
+    log.info(f"{dataset_repo_id=}, {private=}")
+    api = HfApi(token=token)
+    _create_or_get_repo(api, dataset_repo_id, "dataset", private, token)
 
-def upload_model_and_checkpoints(config: ModelUploadConfig) -> _UploadSummary:
-    """Uploads a model directory and optional checkpoints to Hugging Face Hub."""
-    log.info(f"{config=}")
-    api = HfApi(token=config.token)
-    _ensure_repo_exists(
-        api=api,
-        repo_id=config.repo_id,
-        repo_type="model",
-        private=config.private,
-        token=config.token,
+    train_file = _validate_existing_file(train_parquet_path)
+    validation_file = _validate_existing_file(validation_parquet_path)
+    test_file = _validate_existing_file(test_parquet_path)
+
+    api.upload_file(
+        path_or_fileobj=str(train_file),
+        path_in_repo="train.parquet",
+        repo_id=dataset_repo_id,
+        repo_type="dataset",
+        commit_message=commit_message,
+        token=token,
+    )
+    api.upload_file(
+        path_or_fileobj=str(validation_file),
+        path_in_repo="validation.parquet",
+        repo_id=dataset_repo_id,
+        repo_type="dataset",
+        commit_message=commit_message,
+        token=token,
+    )
+    api.upload_file(
+        path_or_fileobj=str(test_file),
+        path_in_repo="test.parquet",
+        repo_id=dataset_repo_id,
+        repo_type="dataset",
+        commit_message=commit_message,
+        token=token,
+    )
+    log.info(
+        f"{train_file=}, {validation_file=}, {test_file=}, "
+        f"{dataset_repo_id=}, {commit_message=}"
     )
 
-    local_model_path = _validate_existing_directory(config.local_model_path)
+
+def upload_model(
+    model_repo_id: str,
+    model_path: str,
+    token: str | None = None,
+    private: bool = False,
+    commit_message: str = "Upload model artifacts",
+) -> None:
+    """Uploads a local model directory to a Hugging Face model repo.
+
+    Args:
+      model_repo_id: Model repository on Hugging Face Hub.
+      model_path: Local model directory path.
+      token: Optional Hugging Face token.
+      private: Whether the repository should be private.
+      commit_message: Commit message used for uploads.
+    """
+    log.info(f"{model_repo_id=}, {model_path=}, {private=}")
+    api = HfApi(token=token)
+    _create_or_get_repo(api, model_repo_id, "model", private, token)
+
+    resolved_model_path = _validate_existing_directory(model_path)
     api.upload_folder(
-        folder_path=str(local_model_path),
+        folder_path=str(resolved_model_path),
         path_in_repo="",
-        repo_id=config.repo_id,
+        repo_id=model_repo_id,
         repo_type="model",
-        commit_message=config.commit_message,
-        token=config.token,
+        commit_message=commit_message,
+        token=token,
     )
-    uploaded_paths = ["/"]
-    _upload_checkpoint_items(api=api, config=config, uploaded_paths=uploaded_paths)
-    log.info(f"{uploaded_paths=}")
-    return _UploadSummary(uploaded_paths=uploaded_paths)
-
-
-class HuggingFaceUploaderCLI:
-    """CLI wrapper for Hugging Face upload utilities."""
-
-    def upload_dataset(self, config_path: str) -> _UploadSummary:
-        """Uploads parquet files using a JSON configuration file."""
-        config = load_dataset_upload_config(config_path)
-        return upload_dataset_parquet_files(config)
-
-    def upload_model(self, config_path: str) -> _UploadSummary:
-        """Uploads model and checkpoints using a JSON configuration file."""
-        config = load_model_upload_config(config_path)
-        return upload_model_and_checkpoints(config)
-
-
-def _load_json_payload(config_path: str) -> dict[str, Any]:
-    """Loads JSON payload from disk."""
-    config_file_path = _validate_existing_file(config_path)
-    payload = json.loads(config_file_path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("Configuration root must be a JSON object.")
-    log.info(f"{config_file_path=}, {list(payload.keys())=}")
-    return payload
-
-
-def _build_parquet_items(raw_items: list[dict[str, Any]]) -> list[ParquetUploadItem]:
-    """Builds strongly-typed parquet upload items from JSON payload."""
-    parquet_items: list[ParquetUploadItem] = []
-    for raw_item in raw_items:
-        parquet_item = ParquetUploadItem(
-            local_file_path=str(raw_item["local_file_path"]),
-            path_in_repo=str(raw_item["path_in_repo"]),
-            split=str(raw_item["split"]),
-            metadata=_build_metadata_payload(raw_item.get("metadata", {})),
-        )
-        parquet_items.append(parquet_item)
-    log.info(f"{parquet_items=}")
-    return parquet_items
-
-
-def _build_metadata_payload(raw_metadata: Any) -> dict[str, JsonValue]:
-    """Builds metadata payload for a parquet item."""
-    if raw_metadata is None:
-        metadata: dict[str, JsonValue] = {}
-        log.info(f"{metadata=}")
-        return metadata
-    if not isinstance(raw_metadata, dict):
-        raise ValueError("`metadata` must be a dictionary.")
-    metadata = {str(key): value for key, value in raw_metadata.items()}
-    log.info(f"{metadata=}")
-    return metadata
-
-
-def _build_checkpoint_items(raw_items: list[dict[str, Any]]) -> list[ModelCheckpointUploadItem]:
-    """Builds strongly-typed checkpoint upload items from JSON payload."""
-    checkpoint_items: list[ModelCheckpointUploadItem] = []
-    for raw_item in raw_items:
-        checkpoint_item = ModelCheckpointUploadItem(
-            local_checkpoint_path=str(raw_item["local_checkpoint_path"]),
-            path_in_repo=str(raw_item["path_in_repo"]),
-        )
-        checkpoint_items.append(checkpoint_item)
-    log.info(f"{checkpoint_items=}")
-    return checkpoint_items
-
-
-def load_dataset_upload_config(config_path: str) -> DatasetUploadConfig:
-    """Loads ``DatasetUploadConfig`` from a JSON file."""
-    payload = _load_json_payload(config_path)
-    parquet_items = _build_parquet_items(list(payload.get("parquet_items", [])))
-    config = DatasetUploadConfig(
-        repo_id=str(payload["repo_id"]),
-        parquet_items=parquet_items,
-        token=payload.get("token"),
-        private=bool(payload.get("private", False)),
-        commit_message=str(payload.get("commit_message", "Upload parquet dataset artifacts")),
-        metadata_path_in_repo=str(payload.get("metadata_path_in_repo", "metadata/parquet_metadata.json")),
-    )
-    log.info(f"{config=}")
-    return config
-
-
-def load_model_upload_config(config_path: str) -> ModelUploadConfig:
-    """Loads ``ModelUploadConfig`` from a JSON file."""
-    payload = _load_json_payload(config_path)
-    checkpoint_items = _build_checkpoint_items(list(payload.get("checkpoint_items", [])))
-    config = ModelUploadConfig(
-        repo_id=str(payload["repo_id"]),
-        local_model_path=str(payload["local_model_path"]),
-        checkpoint_items=checkpoint_items,
-        token=payload.get("token"),
-        private=bool(payload.get("private", False)),
-        commit_message=str(payload.get("commit_message", "Upload model and checkpoints")),
-    )
-    log.info(f"{config=}")
-    return config
+    log.info(f"{resolved_model_path=}, {model_repo_id=}, {commit_message=}")
 
 
 def main() -> None:
-    """Runs the Hugging Face uploader command line interface."""
-    fire.Fire(HuggingFaceUploaderCLI)
+    """Runs the Fire CLI for Hugging Face uploads."""
+    fire.Fire(
+        {
+            "upload_dataset_splits": upload_dataset_splits,
+            "upload_model": upload_model,
+        }
+    )
 
 
 if __name__ == "__main__":
