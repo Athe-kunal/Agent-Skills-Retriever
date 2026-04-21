@@ -1,6 +1,7 @@
 SERVER ?= 0.0.0.0
 EMBD_PORT ?= 8000
 GPU_DEVICE ?= 3
+GPU_IDS ?= 0,1
 EMBD_MODEL ?= Qwen/Qwen3-Embedding-8B
 EMBD_GPU_MEMORY_UTILIZATION ?= 0.9
 EMBD_BASE_URL ?= http://127.0.0.1:$(EMBD_PORT)/v1
@@ -81,6 +82,10 @@ build-mined-negatives-parquet:
 retriever-train:
 	uv run python -m ast_skills.train.train_sentence_transformer train_from_config \
 		--config_path $(TRAIN_CONFIG_PATH)
+
+.PHONY: retriever-train-fsdp-2gpu
+retriever-train-fsdp-2gpu:
+	bash scripts/retriever_train_fsdp_2gpu.sh "$(TRAIN_CONFIG_PATH)" "$(GPU_IDS)"
 
 .PHONY: retriever-evaluate
 retriever-evaluate:

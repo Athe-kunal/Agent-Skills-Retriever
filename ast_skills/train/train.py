@@ -64,6 +64,10 @@ class TrainConfig:
     wandb_project: str = "ast-skills-retriever"
     wandb_entity: str = ""
     run_name: str = "qwen3-parquet-train"
+    fsdp_mode: str = ""
+    fsdp_use_orig_params: bool = True
+    fsdp_cpu_ram_efficient_loading: bool = True
+    fsdp_activation_checkpointing: bool = False
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -178,6 +182,16 @@ def _train_config_from_nested_config(config: dict[str, Any]) -> TrainConfig:
         wandb_project=str(logging_config.get("project", "ast-skills-retriever")),
         wandb_entity=str(logging_config.get("entity", "")),
         run_name=str(logging_config.get("run_name", "qwen3-parquet-train")),
+        fsdp_mode=str(training_config.get("fsdp_mode", "")).strip(),
+        fsdp_use_orig_params=_parse_bool(
+            training_config.get("fsdp_use_orig_params", True), default=True
+        ),
+        fsdp_cpu_ram_efficient_loading=_parse_bool(
+            training_config.get("fsdp_cpu_ram_efficient_loading", True), default=True
+        ),
+        fsdp_activation_checkpointing=_parse_bool(
+            training_config.get("fsdp_activation_checkpointing", False), default=False
+        ),
     )
     log.info(f"{train_config=}")
     return train_config
@@ -381,13 +395,38 @@ class _ParquetValidationEvaluator(SentenceEvaluator):
         return metrics["eval/mrr"]
 
 
+def _build_fsdp_config(config: TrainConfig) -> tuple[str, dict[str, Any] | None]:
+    """Builds FSDP mode and config payload for TrainingArguments."""
+    fsdp_mode = config.fsdp_mode.strip().lower()
+    if not fsdp_mode:
+        log.info(f"{fsdp_mode=}")
+        return "", None
+
+    if fsdp_mode not in {"full_shard", "shard_grad_op", "hybrid_shard", "hybrid_shard_zero2"}:
+        raise ValueError(
+            "`fsdp_mode` must be one of: full_shard, shard_grad_op, "
+            "hybrid_shard, hybrid_shard_zero2, or empty string."
+        )
+
+    fsdp_config = {
+        "backward_prefetch": "backward_pre",
+        "forward_prefetch": False,
+        "use_orig_params": config.fsdp_use_orig_params,
+        "cpu_ram_efficient_loading": config.fsdp_cpu_ram_efficient_loading,
+        "activation_checkpointing": config.fsdp_activation_checkpointing,
+    }
+    log.info(f"{fsdp_mode=}, {fsdp_config=}")
+    return fsdp_mode, fsdp_config
+
+
 def _build_training_args(config: TrainConfig) -> SentenceTransformerTrainingArguments:
     """Builds SentenceTransformerTrainingArguments from TrainConfig."""
     effective_batch = config.batch_size * config.gradient_accumulation_steps
     log.info(
         f"{config.batch_size=}, {config.gradient_accumulation_steps=}, {effective_batch=}, "
-        f"{config.bf16=}, {config.gradient_checkpointing=}"
+        f"{config.bf16=}, {config.gradient_checkpointing=}, {config.fsdp_mode=}"
     )
+    fsdp_mode, fsdp_config = _build_fsdp_config(config)
     return SentenceTransformerTrainingArguments(
         output_dir=config.output_dir,
         num_train_epochs=config.epochs,
@@ -406,6 +445,8 @@ def _build_training_args(config: TrainConfig) -> SentenceTransformerTrainingArgu
         seed=config.seed,
         report_to="wandb" if config.use_wandb else "none",
         run_name=config.run_name,
+        fsdp=fsdp_mode,
+        fsdp_config=fsdp_config,
     )
 
 
@@ -452,6 +493,10 @@ def train(
     wandb_project: str = "ast-skills-retriever",
     wandb_entity: str = "",
     run_name: str = "qwen3-parquet-train",
+    fsdp_mode: str = "",
+    fsdp_use_orig_params: bool = True,
+    fsdp_cpu_ram_efficient_loading: bool = True,
+    fsdp_activation_checkpointing: bool = False,
 ) -> None:
     """Trains sentence-transformer from parquet anchors and summaries."""
     config = TrainConfig(
@@ -476,6 +521,10 @@ def train(
         wandb_project=wandb_project,
         wandb_entity=wandb_entity,
         run_name=run_name,
+        fsdp_mode=fsdp_mode,
+        fsdp_use_orig_params=fsdp_use_orig_params,
+        fsdp_cpu_ram_efficient_loading=fsdp_cpu_ram_efficient_loading,
+        fsdp_activation_checkpointing=fsdp_activation_checkpointing,
     )
     log.info(f"{config=}")
 
