@@ -190,18 +190,6 @@ The training config controls:
 
 ---
 
-## Notes on stale defaults addressed
-
-This repository previously contained stale Makefile defaults and variable collisions.
-Current behavior now:
-
-- Uses `TRAIN_CONFIG_PATH` consistently for both training and config-based evaluation.
-- Removes hardcoded machine-local absolute model path defaults.
-- Splits dataset-mining concurrency variables from training-data-generation variables to avoid accidental overrides.
-- Adds a first-class `help` target for discoverability.
-
----
-
 ## Development checks
 
 ```bash
