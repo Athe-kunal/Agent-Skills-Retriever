@@ -21,13 +21,13 @@ MINED_VALIDATION_RATIO ?= 0.1
 MINED_MAX_CONCURRENCY ?= 16
 
 TRAIN_CONFIG_PATH ?= configs/train.config.yaml
-HF_DATASET_REPO_ID ?=
-HF_MODEL_REPO_ID ?=
+HF_DATASET_REPO_ID ?= Agent-Skills-Retriever
+HF_MODEL_REPO_ID ?= Qwen3-0.6B-Agent-Skills-Retriever
 HF_TRAIN_PARQUET ?= artifacts/retriever_training/train.parquet
 HF_VALIDATION_PARQUET ?= artifacts/retriever_training/validation.parquet
-HF_TEST_PARQUET ?= artifacts/test.parquet
-HF_MODEL_PATH ?= artifacts/sentence_transformers/model
-HF_TOKEN ?=
+HF_TEST_PARQUET ?= artifacts/val.parquet
+HF_MODEL_PATH ?= artifacts/sentence_transformers/qwen3-mined-negatives/checkpoint-470
+HF_TOKEN ?= 
 HF_PRIVATE ?= false
 
 MINED_INPUT_PARQUET ?= artifacts/retriever_training/train.parquet
