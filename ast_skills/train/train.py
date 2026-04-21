@@ -503,9 +503,9 @@ class _FSDPSentenceTransformerTrainer(SentenceTransformerTrainer):
     and model card generation also calls model.encode() on the sharded model,
     causing the same RuntimeError on every checkpoint write.
 
-    The fix: clear stale gradients and use ``FSDP.summon_full_params`` while
-    saving on rank 0. Clearing gradients avoids FSDP grad-view assertion
-    failures when sharded views are restored after checkpoint export.
+    The fix: build a full CPU state_dict via FSDP state-dict APIs and pass that
+    state_dict into save_pretrained(). This avoids touching sharded parameter
+    views during save and prevents FSDP grad-view assertion failures.
     """
 
     def _save(self, output_dir: str | None = None, state_dict=None) -> None:
@@ -517,18 +517,22 @@ class _FSDPSentenceTransformerTrainer(SentenceTransformerTrainer):
             return
 
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import FullStateDictConfig
+        from torch.distributed.fsdp import StateDictType
 
-        self._clear_model_gradients()
-        with FSDP.summon_full_params(
+        full_state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(
             self.model,
-            writeback=False,
-            offload_to_cpu=True,
-            rank0_only=True,
+            StateDictType.FULL_STATE_DICT,
+            full_state_dict_config,
         ):
-            if self.accelerator.is_main_process:
-                unwrapped_model = self.accelerator.unwrap_model(self.model)
-                unwrapped_model.save_pretrained(resolved_dir)
-                torch.save(self.args, os.path.join(resolved_dir, "training_args.bin"))
+            fsdp_full_state_dict = self.model.state_dict()
+        log.info(f"{resolved_dir=}, {len(fsdp_full_state_dict)=}")
+
+        if self.accelerator.is_main_process:
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            unwrapped_model.save_pretrained(resolved_dir, state_dict=fsdp_full_state_dict)
+            torch.save(self.args, os.path.join(resolved_dir, "training_args.bin"))
         log.info(f"{resolved_dir=}")
 
     def _clear_model_gradients(self) -> None:
