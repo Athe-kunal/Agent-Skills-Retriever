@@ -2,7 +2,7 @@
 set -euo pipefail
 
 readonly DEFAULT_CONFIG_PATH="configs/train.config.yaml"
-readonly DEFAULT_GPU_IDS="0,1"
+readonly DEFAULT_GPU_IDS="2,3"
 
 get_config_path() {
   local config_path="${1:-$DEFAULT_CONFIG_PATH}"
@@ -23,9 +23,7 @@ main() {
 
   echo "Launching accelerate FSDP training with ${gpu_ids=} and ${config_path=}"
   CUDA_VISIBLE_DEVICES="${gpu_ids}" uv run accelerate launch \
-    --num_processes 2 \
-    --multi_gpu \
-    --use_fsdp \
+    --config_file configs/fsdp_accelerate.yaml \
     -m ast_skills.train.train train_from_config \
     --config_path "${config_path}"
 }

@@ -12,7 +12,7 @@ training:
   learning_rate: 2.0e-5
   warmup_steps: 200
   evaluation_steps: 200
-  checkpoint_save_steps: 200
+  checkpoint_save_steps: 1
   seed: 13
   use_hard_negatives: true
   triplet_margin: 0.2
@@ -28,7 +28,7 @@ output:
   dir: artifacts/sentence_transformers/qwen3-mined-negatives
 
 logging:
-  use_wandb: false
+  use_wandb: true
   project: ast-skills-retriever
   entity: ""
   run_name: qwen3-mined-negatives-train

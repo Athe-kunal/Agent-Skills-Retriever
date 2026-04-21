@@ -419,6 +419,42 @@ def _build_fsdp_config(config: TrainConfig) -> tuple[str, dict[str, Any] | None]
     return fsdp_mode, fsdp_config
 
 
+class _FSDPSentenceTransformerTrainer(SentenceTransformerTrainer):
+    """SentenceTransformerTrainer with an FSDP-safe _save override.
+
+    sentence-transformers' BaseTrainer._save ignores the state_dict argument
+    passed by Trainer.save_model() and calls model.save_pretrained() directly.
+    With FSDP, that hits a sharded model whose embed_tokens.weight is not 2-D,
+    and model card generation also calls model.encode() on the sharded model,
+    causing the same RuntimeError on every checkpoint write.
+
+    The fix: FSDP.summon_full_params temporarily all-gathers every shard onto
+    rank 0 before calling save_pretrained, then reshards when the context exits.
+    """
+
+    def _save(self, output_dir: str | None = None, state_dict=None) -> None:
+        resolved_dir: str = output_dir or self.args.output_dir or ""
+        os.makedirs(resolved_dir, exist_ok=True)
+
+        if not self.is_fsdp_enabled:
+            super()._save(resolved_dir, state_dict=state_dict)
+            return
+
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        with FSDP.summon_full_params(
+            self.model,
+            writeback=False,
+            offload_to_cpu=True,
+            rank0_only=True,
+        ):
+            if self.accelerator.is_main_process:
+                unwrapped_model = self.accelerator.unwrap_model(self.model)
+                unwrapped_model.save_pretrained(resolved_dir)
+                torch.save(self.args, os.path.join(resolved_dir, "training_args.bin"))
+        log.info(f"{resolved_dir=}")
+
+
 def _build_training_args(config: TrainConfig) -> SentenceTransformerTrainingArguments:
     """Builds SentenceTransformerTrainingArguments from TrainConfig."""
     effective_batch = config.batch_size * config.gradient_accumulation_steps
@@ -435,9 +471,8 @@ def _build_training_args(config: TrainConfig) -> SentenceTransformerTrainingArgu
         warmup_steps=config.warmup_steps,
         eval_strategy="steps",
         eval_steps=config.evaluation_steps,
-        save_strategy="steps",
-        save_steps=config.checkpoint_save_steps,
-        save_total_limit=2,
+        save_strategy="epoch",
+        save_total_limit=None,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         bf16=config.bf16,
         gradient_checkpointing=config.gradient_checkpointing,
@@ -459,7 +494,7 @@ def _train_model(
 ) -> None:
     """Runs SentenceTransformerTrainer fit loop."""
     training_args = _build_training_args(config)
-    trainer = SentenceTransformerTrainer(
+    trainer = _FSDPSentenceTransformerTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -467,7 +502,7 @@ def _train_model(
         evaluator=evaluator,
     )
     trainer.train()
-    model.save_pretrained(config.output_dir)
+    trainer.save_model(config.output_dir)
     log.info(f"{config.output_dir=}")
 
 
