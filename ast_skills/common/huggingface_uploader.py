@@ -12,6 +12,7 @@ from loguru import logger as log
 
 from ast_skills.common.datamodels import (
     DatasetUploadConfig,
+    JsonValue,
     ModelCheckpointUploadItem,
     ModelUploadConfig,
     ParquetUploadItem,
@@ -57,7 +58,7 @@ def _create_dataset_metadata_payload(items: list[ParquetUploadItem]) -> dict[str
         dataset_row = {
             "path_in_repo": _to_posix_path(item.path_in_repo),
             "split": item.split,
-            "metadata": item.metadata,
+            "metadata": dict(item.metadata),
         }
         dataset_rows.append(dataset_row)
     metadata_payload = {"parquet_items": dataset_rows}
@@ -208,11 +209,24 @@ def _build_parquet_items(raw_items: list[dict[str, Any]]) -> list[ParquetUploadI
             local_file_path=str(raw_item["local_file_path"]),
             path_in_repo=str(raw_item["path_in_repo"]),
             split=str(raw_item["split"]),
-            metadata=dict(raw_item.get("metadata", {})),
+            metadata=_build_metadata_payload(raw_item.get("metadata", {})),
         )
         parquet_items.append(parquet_item)
     log.info(f"{parquet_items=}")
     return parquet_items
+
+
+def _build_metadata_payload(raw_metadata: Any) -> dict[str, JsonValue]:
+    """Builds metadata payload for a parquet item."""
+    if raw_metadata is None:
+        metadata: dict[str, JsonValue] = {}
+        log.info(f"{metadata=}")
+        return metadata
+    if not isinstance(raw_metadata, dict):
+        raise ValueError("`metadata` must be a dictionary.")
+    metadata = {str(key): value for key, value in raw_metadata.items()}
+    log.info(f"{metadata=}")
+    return metadata
 
 
 def _build_checkpoint_items(raw_items: list[dict[str, Any]]) -> list[ModelCheckpointUploadItem]:
