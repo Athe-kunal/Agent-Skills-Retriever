@@ -1375,7 +1375,7 @@ def evaluate_from_config(config_path: str = "configs/train.yaml") -> dict[str, f
 def _build_validation_wandb_config(
     validation_parquet: str,
     run_name: str,
-    sentence_batch_size: int,
+    vllm_batch_size: int,
     retrieval_model: str,
     force_reindex: bool,
     max_validation_rows: int,
@@ -1384,7 +1384,7 @@ def _build_validation_wandb_config(
     config = {
         "validation_parquet": validation_parquet,
         "run_name": run_name,
-        "sentence_batch_size": sentence_batch_size,
+        "vllm_batch_size": vllm_batch_size,
         "retrieval_model": retrieval_model,
         "force_reindex": force_reindex,
         "max_validation_rows": max_validation_rows,
@@ -1459,9 +1459,12 @@ def _wait_for_vllm_server_ready(
     while time.monotonic() < deadline:
         exit_code = process.poll()
         if exit_code is not None:
+            stderr_output = ""
+            if process.stderr is not None:
+                stderr_output = process.stderr.read().decode("utf-8", errors="replace")
             raise RuntimeError(
                 "vLLM process exited before the endpoint became ready; "
-                f"{exit_code=}, {probe_url=}. Server stderr was not captured."
+                f"{exit_code=}, {probe_url=}.\nServer stderr:\n{stderr_output}"
             )
         if _probe_vllm_http_ready(
             probe_url=probe_url,
@@ -1601,7 +1604,7 @@ def _maybe_start_vllm_server(
         str(resolved_port),
         "--host",
         "0.0.0.0",
-        "--trust-remote-code",
+        "--trust-remote-code"
     ]
     environment = dict(os.environ)
     environment["CUDA_VISIBLE_DEVICES"] = str(vllm_gpu_device)
@@ -1609,7 +1612,7 @@ def _maybe_start_vllm_server(
         command,
         env=environment,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
     )
     log.info(f"{command=}, {process.pid=}, {resolved_port=}, {resolved_base_url=}")
     _wait_for_vllm_server_ready(
@@ -1847,18 +1850,15 @@ def evaluate_validation_parquet(
     wandb_project: str = "ast-skills-retriever",
     wandb_entity: str = "",
     run_name: str = "validation-parquet-eval",
-    sentence_batch_size: int = 64,
     max_validation_rows: int = 0,
-    use_hf_encoder: bool = False,
     include_hybrid: bool = True,
     hybrid_rrf_k: int = 60,
-    hf_num_workers: int = 4,
 ) -> dict[str, dict[str, dict[str, float]]]:
     """Evaluates summary/description retrieval on validation parquet.
 
-    Runs the given retrieval_model (vLLM or HuggingFace) across both
-    retrieval fields (summary and description). Dense metrics always run,
-    and hybrid metrics (dense + BM25 via RRF) are enabled by default.
+    Runs the given retrieval_model via vLLM across both retrieval fields
+    (summary and description). Dense metrics always run, and hybrid metrics
+    (dense + BM25 via RRF) are enabled by default.
     """
     uses_default_base_url = not vllm_base_url
     if uses_default_base_url:
@@ -1874,6 +1874,7 @@ def evaluate_validation_parquet(
     )
     if start_vllm_server and uses_default_base_url:
         vllm_base_url = vllm_startup.resolved_base_url
+
     vllm_process = vllm_startup.process
     validation_payload = _load_validation_payload(validation_parquet=validation_parquet)
     validation_payload = _slice_validation_payload(
@@ -1889,40 +1890,24 @@ def evaluate_validation_parquet(
         config=_build_validation_wandb_config(
             validation_parquet=validation_parquet,
             run_name=run_name,
-            sentence_batch_size=sentence_batch_size,
+            vllm_batch_size=vllm_batch_size,
             retrieval_model=retrieval_model,
             force_reindex=force_reindex,
             max_validation_rows=max_validation_rows,
         ),
     )
 
-    if _is_colbert_hf_model(retrieval_model):
-        hf_assets = _load_hf_encoder(model_name=retrieval_model)
-        query_embeddings = _encode_colbert_hf_embeddings(
-            assets=hf_assets,
+    query_client = AsyncOpenAI(base_url=vllm_base_url, api_key=vllm_api_key)
+    query_embeddings = asyncio.run(
+        _encode_vllm_async(
+            client=query_client,
+            embedding_model=retrieval_model,
             texts=validation_payload.query_texts,
-            batch_size=sentence_batch_size,
-            num_workers=hf_num_workers,
+            batch_size=vllm_batch_size,
+            max_concurrency=vllm_max_concurrency,
+            progress_desc="Validation query embeddings",
         )
-    elif use_hf_encoder:
-        hf_assets = _load_hf_encoder(model_name=retrieval_model)
-        query_embeddings = _encode_hf_sentence_embeddings(
-            assets=hf_assets,
-            texts=validation_payload.query_texts,
-            batch_size=sentence_batch_size,
-        )
-    else:
-        query_client = AsyncOpenAI(base_url=vllm_base_url, api_key=vllm_api_key)
-        query_embeddings = asyncio.run(
-            _encode_vllm_async(
-                client=query_client,
-                embedding_model=retrieval_model,
-                texts=validation_payload.query_texts,
-                batch_size=vllm_batch_size,
-                max_concurrency=vllm_max_concurrency,
-                progress_desc="Validation query embeddings",
-            )
-        )
+    )
 
     try:
         for field_config in VALIDATION_FIELD_CONFIGS:
@@ -1933,23 +1918,16 @@ def evaluate_validation_parquet(
             )
             metrics_by_model: dict[str, RetrievalMetrics] = {}
 
-            corpus_batch_size = (
-                sentence_batch_size
-                if _is_colbert_hf_model(retrieval_model) or use_hf_encoder
-                else vllm_batch_size
-            )
             chroma_artifacts = _load_chroma_corpus_artifacts(
                 artifacts_root=artifacts_root,
                 field_key=field_key,
                 model_name=retrieval_model,
                 corpus=corpus,
                 force_reindex=force_reindex,
-                batch_size=corpus_batch_size,
+                batch_size=vllm_batch_size,
                 vllm_base_url=vllm_base_url,
                 vllm_api_key=vllm_api_key,
                 vllm_max_concurrency=vllm_max_concurrency,
-                use_hf_encoder=use_hf_encoder,
-                hf_num_workers=hf_num_workers,
             )
             dense_score_matrix = _score_bi_encoder(
                 query_embeddings=query_embeddings,
@@ -1998,7 +1976,7 @@ def evaluate_validation_parquet(
                 )
             metrics_by_field[field_key] = metrics_by_model
     finally:
-        if vllm_process is not None:
+        if start_vllm_server and vllm_process is not None:
             vllm_process.terminate()
             log.info(f"{vllm_process.pid=}, stopped=True")
 
@@ -2140,9 +2118,6 @@ def build_validation_indexes(
     vllm_gpu_device: int = 3,
     vllm_port: int = 8002,
     vllm_gpu_memory_utilization: float = 0.9,
-    use_hf_encoder: bool = False,
-    sentence_batch_size: int = 64,
-    hf_num_workers: int = 4,
 ) -> dict[str, dict[str, int]]:
     """Builds and caches Chroma and BM25 artifacts for validation retrieval."""
     uses_default_base_url = not vllm_base_url
@@ -2197,23 +2172,16 @@ def build_validation_indexes(
                 rows=validation_payload.rows,
                 field_key=field_key,
             )
-            corpus_batch_size = (
-                sentence_batch_size
-                if _is_colbert_hf_model(retrieval_model) or use_hf_encoder
-                else vllm_batch_size
-            )
             chroma_artifacts = _load_chroma_corpus_artifacts(
                 artifacts_root=artifacts_root,
                 field_key=field_key,
                 model_name=retrieval_model,
                 corpus=corpus,
                 force_reindex=force_reindex,
-                batch_size=corpus_batch_size,
+                batch_size=vllm_batch_size,
                 vllm_base_url=vllm_base_url,
                 vllm_api_key=vllm_api_key,
                 vllm_max_concurrency=vllm_max_concurrency,
-                use_hf_encoder=use_hf_encoder,
-                hf_num_workers=hf_num_workers,
             )
             bm25_cache = _load_or_write_bm25_docs(
                 artifacts_root=artifacts_root,
@@ -2298,7 +2266,6 @@ async def evaluate_validated_skill_questions_async(
         wandb_project=wandb_project,
         wandb_entity=wandb_entity,
         run_name=run_name,
-        sentence_batch_size=sentence_batch_size,
     )
     return _build_split_result_payload(
         train_parquet=output_train_parquet,

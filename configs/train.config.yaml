@@ -6,13 +6,14 @@ model:
   name: Qwen/Qwen3-Embedding-0.6B
 
 training:
-  epochs: 1
+  epochs: 3
   batch_size: 128
   gradient_accumulation_steps: 1
   learning_rate: 2.0e-5
   warmup_steps: 200
+  eval_strategy: epoch
   evaluation_steps: 1
-  save_strategy: steps
+  save_strategy: epoch
   checkpoint_save_steps: 1
   seed: 13
   use_hard_negatives: true

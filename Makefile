@@ -1,7 +1,7 @@
 SERVER ?= 0.0.0.0
 EMBD_PORT ?= 8000
 GPU_DEVICE ?= 3
-GPU_IDS ?= 2,3
+GPU_IDS ?= 3
 EMBD_MODEL ?= Qwen/Qwen3-Embedding-8B
 EMBD_GPU_MEMORY_UTILIZATION ?= 0.9
 EMBD_BASE_URL ?= http://127.0.0.1:$(EMBD_PORT)/v1
@@ -36,10 +36,20 @@ MINED_KEEP_NEGATIVES ?= 32
 MINED_RRF_K ?= 60
 MINED_INCLUDE_NEGATIVE_DESCRIPTIONS ?= false
 
-EVAL_DENSE_MODELS ?= lightonai/GTE-ModernColBERT-v1,jinaai/jina-colbert-v2
+EVAL_MODEL ?= /home/recoverx/astarag/AST-Based-Agent-Skills/artifacts/sentence_transformers/qwen3-mined-negatives/checkpoint-1410
 EVAL_VAL_PARQUET ?= artifacts/val.parquet
 EVAL_WANDB_PROJECT ?= ast-skills-retriever
-
+EVAL_VLLM_PORT ?= 8140
+EVAL_VLLM_GPU ?= 1
+EVAL_WANDB_ENTITY ?= ad-finance
+EVAL_FORCE_REINDEX ?= false
+EVAL_START_VLLM ?= true
+EVAL_VLLM_BASE_URL ?=
+EVAL_VLLM_BATCH_SIZE ?= 512
+EVAL_VLLM_MAX_CONCURRENCY ?= 32
+EVAL_RUN_NAME ?= validation-parquet-eval
+EVAL_USE_HF_ENCODER ?= false
+EVAL_MAX_VAL_ROWS ?= 0
 # Qwen/Qwen3-Embedding-0.6B,Qwen/Qwen3-Embedding-4B,Qwen/Qwen3-Embedding-8B,sentence-transformers/bert-large-nli-mean-tokens
 
 .PHONY: vllm-embd-serve
@@ -101,13 +111,12 @@ retriever-evaluate-validation:
 		--start_vllm_server $(EVAL_START_VLLM) \
 		--vllm_gpu_device $(EVAL_VLLM_GPU) \
 		--vllm_port $(EVAL_VLLM_PORT) \
-		--vllm_base_url $(EVAL_VLLM_BASE_URL) \
+		$(if $(EVAL_VLLM_BASE_URL),--vllm_base_url $(EVAL_VLLM_BASE_URL)) \
 		--vllm_batch_size $(EVAL_VLLM_BATCH_SIZE) \
 		--vllm_max_concurrency $(EVAL_VLLM_MAX_CONCURRENCY) \
 		--wandb_project $(EVAL_WANDB_PROJECT) \
 		--wandb_entity $(EVAL_WANDB_ENTITY) \
 		--run_name $(EVAL_RUN_NAME) \
-		--use_hf_encoder $(EVAL_USE_HF_ENCODER) \
 		--max_validation_rows $(EVAL_MAX_VAL_ROWS)
 
 .PHONY: retriever-evaluate-validation-bm25

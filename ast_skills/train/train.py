@@ -52,6 +52,7 @@ class TrainConfig:
     batch_size: int = 32
     learning_rate: float = 2e-5
     warmup_steps: int = 200
+    eval_strategy: str = "epoch"
     evaluation_steps: int = 200
     save_strategy: str = "epoch"
     checkpoint_save_steps: int = 200
@@ -103,13 +104,21 @@ def _parse_bool(value: Any, default: bool) -> bool:
     return default
 
 
+def _parse_eval_strategy(value: Any, default: str = "epoch") -> str:
+    """Parses and validates evaluation strategy."""
+    normalized_value = str(value or default).strip().lower()
+    if normalized_value in {"epoch", "steps", "no"}:
+        log.info(f"{normalized_value=}")
+        return normalized_value
+    raise ValueError("`eval_strategy` must be one of: 'epoch', 'steps', 'no'.")
+
+
 def _parse_save_strategy(value: Any, default: str = "epoch") -> str:
     """Parses and validates checkpoint save strategy."""
     normalized_value = str(value or default).strip().lower()
     if normalized_value in {"epoch", "steps"}:
         log.info(f"{normalized_value=}")
         return normalized_value
-
     raise ValueError("`save_strategy` must be either 'epoch' or 'steps'.")
 
 
@@ -179,6 +188,7 @@ def _train_config_from_nested_config(config: dict[str, Any]) -> TrainConfig:
         batch_size=int(training_config.get("batch_size", 32)),
         learning_rate=float(training_config.get("learning_rate", 2e-5)),
         warmup_steps=int(training_config.get("warmup_steps", 200)),
+        eval_strategy=_parse_eval_strategy(training_config.get("eval_strategy", "epoch")),
         evaluation_steps=int(training_config.get("evaluation_steps", 200)),
         save_strategy=_parse_save_strategy(training_config.get("save_strategy", "epoch")),
         checkpoint_save_steps=int(training_config.get("checkpoint_save_steps", 200)),
@@ -553,15 +563,19 @@ def _build_training_args(config: TrainConfig) -> SentenceTransformerTrainingArgu
     )
     fsdp_mode, fsdp_config = _build_fsdp_config(config)
     save_steps = config.checkpoint_save_steps if config.save_strategy == "steps" else None
-    log.info(f"{config.save_strategy=}, {config.checkpoint_save_steps=}, {save_steps=}")
+    eval_steps = config.evaluation_steps if config.eval_strategy == "steps" else None
+    log.info(
+        f"{config.save_strategy=}, {config.checkpoint_save_steps=}, {save_steps=}, "
+        f"{config.eval_strategy=}, {eval_steps=}"
+    )
     return SentenceTransformerTrainingArguments(
         output_dir=config.output_dir,
         num_train_epochs=config.epochs,
         per_device_train_batch_size=config.batch_size,
         learning_rate=config.learning_rate,
         warmup_steps=config.warmup_steps,
-        eval_strategy="steps",
-        eval_steps=config.evaluation_steps,
+        eval_strategy=config.eval_strategy,
+        eval_steps=eval_steps,  # type: ignore[arg-type]  # None is valid when eval_strategy="epoch"
         save_strategy=config.save_strategy,
         save_steps=save_steps,  # type: ignore[arg-type]  # None is valid when save_strategy="epoch"
         save_total_limit=None,
@@ -607,6 +621,7 @@ def train(
     batch_size: int = 32,
     learning_rate: float = 2e-5,
     warmup_steps: int = 200,
+    eval_strategy: str = "epoch",
     evaluation_steps: int = 200,
     save_strategy: str = "epoch",
     checkpoint_save_steps: int = 200,
@@ -636,6 +651,7 @@ def train(
         batch_size=batch_size,
         learning_rate=learning_rate,
         warmup_steps=warmup_steps,
+        eval_strategy=_parse_eval_strategy(eval_strategy),
         evaluation_steps=evaluation_steps,
         save_strategy=_parse_save_strategy(save_strategy),
         checkpoint_save_steps=checkpoint_save_steps,
