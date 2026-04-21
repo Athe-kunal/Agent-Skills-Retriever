@@ -21,6 +21,14 @@ MINED_VALIDATION_RATIO ?= 0.1
 MINED_MAX_CONCURRENCY ?= 16
 
 TRAIN_CONFIG_PATH ?= configs/train.config.yaml
+HF_DATASET_REPO_ID ?=
+HF_MODEL_REPO_ID ?=
+HF_TRAIN_PARQUET ?= artifacts/retriever_training/train.parquet
+HF_VALIDATION_PARQUET ?= artifacts/retriever_training/validation.parquet
+HF_TEST_PARQUET ?= artifacts/test.parquet
+HF_MODEL_PATH ?= artifacts/sentence_transformers/model
+HF_TOKEN ?=
+HF_PRIVATE ?= false
 
 MINED_INPUT_PARQUET ?= artifacts/retriever_training/train.parquet
 MINED_OUTPUT_PARQUET ?= artifacts/retriever_training/training_data.parquet
@@ -172,3 +180,21 @@ build-mined-training-data:
 		--keep_negatives $(MINED_KEEP_NEGATIVES) \
 		--rrf_k $(MINED_RRF_K) \
 		--include_negative_descriptions $(MINED_INCLUDE_NEGATIVE_DESCRIPTIONS)
+
+.PHONY: hf-upload-dataset
+hf-upload-dataset:
+	uv run python -m ast_skills.common.huggingface_uploader upload_dataset_splits \
+		--dataset_repo_id $(HF_DATASET_REPO_ID) \
+		--train_parquet_path $(HF_TRAIN_PARQUET) \
+		--validation_parquet_path $(HF_VALIDATION_PARQUET) \
+		--test_parquet_path $(HF_TEST_PARQUET) \
+		$(if $(HF_TOKEN),--token $(HF_TOKEN)) \
+		--private $(HF_PRIVATE)
+
+.PHONY: hf-upload-model
+hf-upload-model:
+	uv run python -m ast_skills.common.huggingface_uploader upload_model \
+		--model_repo_id $(HF_MODEL_REPO_ID) \
+		--model_path $(HF_MODEL_PATH) \
+		$(if $(HF_TOKEN),--token $(HF_TOKEN)) \
+		--private $(HF_PRIVATE)
