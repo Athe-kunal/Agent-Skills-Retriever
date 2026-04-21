@@ -52,6 +52,7 @@ class TrainConfig:
     learning_rate: float = 2e-5
     warmup_steps: int = 200
     evaluation_steps: int = 200
+    save_strategy: str = "epoch"
     checkpoint_save_steps: int = 200
     seed: int = 13
     use_hard_negatives: bool = True
@@ -99,6 +100,16 @@ def _parse_bool(value: Any, default: bool) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     return default
+
+
+def _parse_save_strategy(value: Any, default: str = "epoch") -> str:
+    """Parses and validates checkpoint save strategy."""
+    normalized_value = str(value or default).strip().lower()
+    if normalized_value in {"epoch", "steps"}:
+        log.info(f"{normalized_value=}")
+        return normalized_value
+
+    raise ValueError("`save_strategy` must be either 'epoch' or 'steps'.")
 
 
 def _train_kwargs_from_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -168,6 +179,7 @@ def _train_config_from_nested_config(config: dict[str, Any]) -> TrainConfig:
         learning_rate=float(training_config.get("learning_rate", 2e-5)),
         warmup_steps=int(training_config.get("warmup_steps", 200)),
         evaluation_steps=int(training_config.get("evaluation_steps", 200)),
+        save_strategy=_parse_save_strategy(training_config.get("save_strategy", "epoch")),
         checkpoint_save_steps=int(training_config.get("checkpoint_save_steps", 200)),
         seed=int(training_config.get("seed", 13)),
         use_hard_negatives=_parse_bool(training_config.get("use_hard_negatives", True), default=True),
@@ -428,8 +440,9 @@ class _FSDPSentenceTransformerTrainer(SentenceTransformerTrainer):
     and model card generation also calls model.encode() on the sharded model,
     causing the same RuntimeError on every checkpoint write.
 
-    The fix: FSDP.summon_full_params temporarily all-gathers every shard onto
-    rank 0 before calling save_pretrained, then reshards when the context exits.
+    The fix: build a full CPU state_dict via FSDP state-dict APIs and pass that
+    state_dict into save_pretrained(). This avoids touching sharded parameter
+    views during save and prevents FSDP grad-view assertion failures.
     """
 
     def _save(self, output_dir: str | None = None, state_dict=None) -> None:
@@ -441,17 +454,22 @@ class _FSDPSentenceTransformerTrainer(SentenceTransformerTrainer):
             return
 
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import FullStateDictConfig
+        from torch.distributed.fsdp import StateDictType
 
-        with FSDP.summon_full_params(
+        full_state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(
             self.model,
-            writeback=False,
-            offload_to_cpu=True,
-            rank0_only=True,
+            StateDictType.FULL_STATE_DICT,
+            full_state_dict_config,
         ):
-            if self.accelerator.is_main_process:
-                unwrapped_model = self.accelerator.unwrap_model(self.model)
-                unwrapped_model.save_pretrained(resolved_dir)
-                torch.save(self.args, os.path.join(resolved_dir, "training_args.bin"))
+            fsdp_full_state_dict = self.model.state_dict()
+        log.info(f"{resolved_dir=}, {len(fsdp_full_state_dict)=}")
+
+        if self.accelerator.is_main_process:
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            unwrapped_model.save_pretrained(resolved_dir, state_dict=fsdp_full_state_dict)
+            torch.save(self.args, os.path.join(resolved_dir, "training_args.bin"))
         log.info(f"{resolved_dir=}")
 
 
@@ -463,6 +481,8 @@ def _build_training_args(config: TrainConfig) -> SentenceTransformerTrainingArgu
         f"{config.bf16=}, {config.gradient_checkpointing=}, {config.fsdp_mode=}"
     )
     fsdp_mode, fsdp_config = _build_fsdp_config(config)
+    save_steps = config.checkpoint_save_steps if config.save_strategy == "steps" else None
+    log.info(f"{config.save_strategy=}, {config.checkpoint_save_steps=}, {save_steps=}")
     return SentenceTransformerTrainingArguments(
         output_dir=config.output_dir,
         num_train_epochs=config.epochs,
@@ -471,7 +491,8 @@ def _build_training_args(config: TrainConfig) -> SentenceTransformerTrainingArgu
         warmup_steps=config.warmup_steps,
         eval_strategy="steps",
         eval_steps=config.evaluation_steps,
-        save_strategy="epoch",
+        save_strategy=config.save_strategy,
+        save_steps=save_steps,
         save_total_limit=None,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         bf16=config.bf16,
@@ -516,6 +537,7 @@ def train(
     learning_rate: float = 2e-5,
     warmup_steps: int = 200,
     evaluation_steps: int = 200,
+    save_strategy: str = "epoch",
     checkpoint_save_steps: int = 200,
     seed: int = 13,
     use_hard_negatives: bool = True,
@@ -544,6 +566,7 @@ def train(
         learning_rate=learning_rate,
         warmup_steps=warmup_steps,
         evaluation_steps=evaluation_steps,
+        save_strategy=_parse_save_strategy(save_strategy),
         checkpoint_save_steps=checkpoint_save_steps,
         seed=seed,
         use_hard_negatives=use_hard_negatives,
